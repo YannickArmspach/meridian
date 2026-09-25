@@ -13,7 +13,7 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 
 | Variable | Alias | Default | Description |
 |----------|-------|---------|-------------|
-| `MERIDIAN_API_KEY` | — | unset | Shared secret for API key authentication. When set, all API and admin routes require a matching `x-api-key` or `Authorization: Bearer` header. `/` and `/health` remain open. |
+| `MERIDIAN_API_KEY` | — | unset | Shared secret for API key authentication. When set, all API and admin routes require a matching `x-api-key` or `Authorization: Bearer` header; browsers sign in once at `/login` instead and get a session cookie. `/`, `/health` and `/login` remain open. |
 | `MERIDIAN_PORT` | `CLAUDE_PROXY_PORT` | `3456` | Port to listen on |
 | `MERIDIAN_HOST` | `CLAUDE_PROXY_HOST` | `127.0.0.1` | Host to bind to |
 | `MERIDIAN_PASSTHROUGH` | `CLAUDE_PROXY_PASSTHROUGH` | unset | Forward tool calls to client instead of executing |
@@ -713,7 +713,7 @@ MERIDIAN_API_KEY=your-secret-key meridian
 
 When set:
 - All API routes (`/v1/messages`, `/v1/chat/completions`, etc.) and admin routes (`/telemetry`, `/metrics`, `/profiles`) require a matching key
-- `/` and `/health` remain open (monitoring tools need unauthenticated health checks)
+- `/`, `/health` and `/login` remain open (monitoring tools need unauthenticated health checks; `/login` is the browser gate itself)
 - Keys are accepted via `x-api-key` header or `Authorization: Bearer` header
 
 Clients just set their `ANTHROPIC_API_KEY` to the shared secret — since most tools already send this header, no workflow changes are needed:
@@ -721,6 +721,19 @@ Clients just set their `ANTHROPIC_API_KEY` to the shared secret — since most t
 ```bash
 ANTHROPIC_API_KEY=your-secret-key ANTHROPIC_BASE_URL=http://meridian-host:3456 opencode
 ```
+
+### Dashboard sign-in
+
+Browsers can't attach an `x-api-key` header, so the web dashboard authenticates
+with a one-time sign-in instead. Opening any protected page redirects to
+`/login`; entering the key sets an HttpOnly `SameSite=Lax` session cookie
+(valid 7 days, `Secure` when reached over HTTPS) and returns you to the page
+you asked for.
+
+The cookie holds an HMAC derived from the key — never the key itself — so it
+can't be replayed as an `x-api-key` by API clients, and rotating
+`MERIDIAN_API_KEY` immediately signs out every browser session. There is no
+server-side session state to manage.
 
 ## CLI Commands
 
