@@ -107,7 +107,17 @@ describe("auth audit: every registered prefix is protected when MERIDIAN_API_KEY
   //                   unhealthy the moment MERIDIAN_API_KEY is set, so an auth
   //                   setting would become a total outage of whatever sits in
   //                   front - the failure this pair exists to prevent.
-  const PUBLIC_PREFIXES = new Set(["/", "/health", "/livez", "/readyz"])
+  // The review for `/login`:
+  //
+  //   what it emits   GET: a static sign-in form with zero data behind it.
+  //                   POST: verifies the submitted key (constant-time) and
+  //                   answers 401 + the same form on mismatch. Neither leaks
+  //                   whether a key is configured beyond what any gated route
+  //                   already reveals.
+  //   why not gated   it is the gate. requireAuth redirects browsers here;
+  //                   a 401 on the login form itself would lock every browser
+  //                   out of the dashboard permanently.
+  const PUBLIC_PREFIXES = new Set(["/", "/health", "/livez", "/readyz", "/login"])
 
   it("rejects unauthenticated requests to every non-public route prefix", async () => {
     const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })

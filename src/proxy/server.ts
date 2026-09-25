@@ -90,7 +90,8 @@ import { translateResponsesToAnthropic, translateAnthropicToResponses, createRes
 import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages } from "./replay"
 import { unstreamedAssistantBlockFrames } from "./unstreamedAssistant"
 import { extractAdvisorModel, extractSystemText, getLastUserMessage, stripAdvisorTools, stripNonStandardStreamFields, MULTIMODAL_TYPES, buildToolUseIndex, frameReplayTurns } from "./messages"
-import { requireAuth, authEnabled } from "./auth"
+import { requireAuth, authEnabled, hasValidApiKey, verifyApiKey, buildAuthCookie } from "./auth"
+import { loginPageHtml } from "../telemetry/loginPage"
 import { detectAdapter } from "./adapters/detect"
 import { buildQueryOptions, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
 import { normalizeEffort } from "./effort"
@@ -989,6 +990,35 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   app.use("/providers", requireAuth)
   app.use("/providers/*", requireAuth)
   app.use("/antigravity/*", requireAuth)
+
+  // Dashboard sign-in. Intentionally ungated (it IS the gate): a browser
+  // that lands on a protected page without credentials is redirected here
+  // by requireAuth, posts the API key once, and gets an HttpOnly session
+  // cookie derived from the key. `/login` is on PUBLIC_PREFIXES in the
+  // proxy-settings-auth audit with its own review note.
+  //
+  // `next` must stay a same-origin path — anything else (protocol-relative
+  // `//evil.com`, absolute URLs, backslash tricks) collapses to "/" so the
+  // login form can never be used as an open redirect.
+  const sanitizeNext = (next: string | undefined): string =>
+    next && next.startsWith("/") && !next.startsWith("//") && !next.includes("\\") ? next : "/"
+  app.get("/login", c => {
+    if (!authEnabled()) return c.redirect("/", 302)
+    const next = sanitizeNext(c.req.query("next"))
+    if (hasValidApiKey(c.req.raw.headers)) return c.redirect(next, 302)
+    return c.html(loginPageHtml({ next }))
+  })
+  app.post("/login", async c => {
+    if (!authEnabled()) return c.redirect("/", 302)
+    const body = await c.req.parseBody()
+    const next = sanitizeNext(typeof body.next === "string" ? body.next : undefined)
+    if (typeof body.key !== "string" || !verifyApiKey(body.key)) {
+      return c.html(loginPageHtml({ next, error: true }), 401)
+    }
+    const secure = c.req.header("x-forwarded-proto") === "https" || new URL(c.req.url).protocol === "https:"
+    c.header("Set-Cookie", buildAuthCookie(secure))
+    return c.redirect(next, 302)
+  })
 
   // Separate provider routes; Claude retains all existing paths and semantics.
   app.all('/antigravity/*', c => {

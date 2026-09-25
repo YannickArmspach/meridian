@@ -170,6 +170,10 @@ describe("design-system conformance (DESIGN.md)", () => {
     "src/telemetry/settingsPage.ts",
     "src/telemetry/profilePage.ts",
     "src/proxy/plugins/pluginPage.ts",
+    // The login page skips the shared header on purpose (its fetches are
+    // gated — see loginPage.ts) but still owes the token-only color rule
+    // and the shared backsplash.
+    "src/telemetry/loginPage.ts",
   ]
 
   test("pages contain no hardcoded hex colors — tokens only", async () => {
