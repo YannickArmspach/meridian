@@ -15,7 +15,7 @@ services:
       init:
         condition: service_completed_successfully
     ports:
-      - "3456:3456"
+      - "127.0.0.1:3456:3456"
     volumes:
       - claude-auth:/home/claude/.claude
     restart: unless-stopped
