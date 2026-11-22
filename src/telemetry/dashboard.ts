@@ -20,6 +20,7 @@ export const dashboardHtml = `<!DOCTYPE html>
          color: var(--text); padding: 0; line-height: 1.5; }
   h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
   .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .container { padding: 24px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
   .card-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
@@ -83,7 +84,7 @@ export const dashboardHtml = `<!DOCTYPE html>
 </head>
 <body>
 ` + profileBarHtml + `
-<div style="padding:24px">
+<div class="container">
 <h1>Telemetry</h1>
 <div class="subtitle">Request performance, cost, and wire-contract integrity</div>
 
@@ -443,6 +444,17 @@ function render(s, reqs, logs, routes, health) {
       + '</div>';
   }
 
+  // Prompt-cache keepalive beats: excluded from every figure above.
+  const ka = s.cacheKeepalive;
+  if (ka && ka.beats > 0) {
+    html += '<div class="section"><div class="section-title">Cache Keepalive</div></div>';
+    html += '<div class="cards">'
+      + card('Beats', ka.beats, ka.reached + ' reached' + (ka.notReached > 0 ? ' / ' + ka.notReached + ' skipped' : ''))
+      + card('Cache Read', fmtTok(ka.cacheReadTokens), fmtTok(ka.cacheCreationTokens) + ' written')
+      + card('Est. API Cost', usd(ka.estimatedUsd), 'not included in the totals above')
+      + '</div>';
+  }
+
   // Estimated cost: static API list pricing applied to the window's token usage
   if (s.costEstimate && Object.keys(s.costEstimate.byModel).length > 0) {
     const ce = s.costEstimate;
@@ -472,8 +484,8 @@ function render(s, reqs, logs, routes, health) {
         + '</tr>';
     }
     html += '</tbody></table>'
-      + '<div class="usage-note" style="margin-top:8px">Estimated at static Anthropic API list prices'
-      + ' (cache writes at the 5-minute TTL rate). Claude Max usage is covered by your subscription'
+      + '<div class="usage-note" style="margin-top:8px">Estimated at static Anthropic and OpenAI API list prices'
+      + ' (cache writes at the 5-minute TTL rate). Subscription usage is covered by your subscription'
       + ' (equivalent API cost, not a charge).'
       + (ce.unpricedRequestCount > 0
           ? ' ' + ce.unpricedRequestCount + ' request' + (ce.unpricedRequestCount === 1 ? '' : 's') + ' from unrecognized models excluded.'
@@ -531,7 +543,8 @@ function render(s, reqs, logs, routes, health) {
   const maxTotal = Math.max(...reqs.map(r => r.totalDurationMs), 1);
 
   for (const r of reqs) {
-    const statusClass = r.error ? 'status-err' : 'status-ok';
+    // A keepalive beat that never reached upstream was skipped, not failed.
+    const statusClass = r.error ? (r.requestSource === 'cache-keepalive' ? '' : 'status-err') : 'status-ok';
     const statusText = r.error ? r.error : r.status;
     const scale = 280 / maxTotal;
     const sessionQW = r.sessionQueueWaitMs || 0;

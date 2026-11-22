@@ -24,6 +24,7 @@
  */
 
 import type { LimitDiagnosis } from "./limitDetection"
+import type { WeeklyModelFamily } from "./routing"
 
 export interface SpentRecord {
   profileId: string
@@ -34,6 +35,14 @@ export interface SpentRecord {
   until: number | null
   /** Truncated raw SDK message - the operator's evidence for the verdict. */
   message: string
+  /**
+   * The model family routing benched this profile for alone, when this
+   * refusal came from that family's own weekly bucket and matched the refused
+   * request's model. Null for every refusal that benches the whole profile or
+   * none: account-wide, unknown, guessed, billing, another family's bucket,
+   * and refusals outside pool routing.
+   */
+  modelFamily: WeeklyModelFamily | null
 }
 
 /**
@@ -72,6 +81,7 @@ export class SpentStore {
       diagnosis,
       until,
       message: message.length > 300 ? `${message.slice(0, 300)}…` : message,
+      modelFamily: null,
     }
     this.records.set(profileId, record)
     return record
@@ -99,6 +109,10 @@ export class SpentStore {
 
   clear(): void {
     this.records.clear()
+  }
+
+  forget(profileId: string): void {
+    this.records.delete(profileId)
   }
 }
 
@@ -132,6 +146,8 @@ export interface FailoverEvent {
   internalHop: boolean
   until: number | null
   limit: LimitDiagnosis | null
+  /** Which provider's account this is; absent means Claude. */
+  provider?: "chatgpt"
 }
 
 export interface FailoverEventPage {

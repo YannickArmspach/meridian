@@ -99,6 +99,8 @@ Called before the request is sent to the Claude SDK. Receives the full request c
 | `supportsThinking` | `boolean` | Forward thinking blocks |
 | `metadata` | `Record<string, unknown>` | Plugin-to-plugin state |
 
+Returned message histories must contain at least one message with a role and string or array content. Changing the history sends the complete transformed history to the SDK and starts a fresh execution; client history still controls session ownership and continuation checks. Equivalent copies preserve normal resumes. Repeated history changes therefore incur replay cost; preserve completed tool calls and their results together.
+
 **Example — add a system prompt addendum:**
 ```ts
 onRequest(ctx) {
@@ -155,7 +157,7 @@ export default {
 }
 ```
 
-Canonical adapter names: `opencode`, `crush`, `droid`, `pi`, `prime`, `forgecode`, `passthrough`, `cherry`, `claude-code`, `polytoken`, `openai`, `jcode`, `codex`. Instances inherit their base adapter's plugin scope.
+Canonical adapter names: `opencode`, `crush`, `droid`, `pi`, `prime`, `forgecode`, `passthrough`, `cherry`, `claude-code`, `polytoken`, `openai`, `jcode`, `letta`, `codex`. Instances inherit their base adapter's plugin scope.
 
 ## Plugin Configuration
 
@@ -262,6 +264,26 @@ Visit `http://localhost:3456/plugins` to:
 - View which hooks each plugin registers
 - View adapter scope
 - Reload plugins without restarting
+
+## Update Checks
+
+With **Check for updates** on (`/settings`, Updates), Meridian also checks each
+loaded plugin that was installed from an npm package: it reads the `name` and
+`version` of the nearest `package.json` above the plugin file and compares
+them with that package's `latest` on the registry. Publish your plugin with
+its `package.json` beside the built entry and users are told when they fall
+behind.
+
+The same toggle governs both checks, so turning it on also sends every loaded
+plugin's npm package name to the registry (`https://registry.npmjs.org`, or
+`MERIDIAN_UPDATE_CHECK_REGISTRY`). Nothing is sent while it is off. A lone file
+in `plugins/` (or a symlink to one), a private package, and a package whose
+`publishConfig.registry` names a non-public registry other than the one being
+asked are listed as not checkable; packages published to public npm are
+checked through a configured mirror. An instance that points Meridian's own check at a mirror with
+`MERIDIAN_UPDATE_CHECK_URL` checks no plugin until
+`MERIDIAN_UPDATE_CHECK_REGISTRY` names the registry to use. See
+[Build provenance](docs/configuration.md#build-provenance-and-staying-current).
 
 ## Roadmap
 

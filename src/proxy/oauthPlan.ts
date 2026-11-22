@@ -44,9 +44,10 @@ export interface OAuthPlanFields {
    * byte-identical to what a personal Max 5x reports — and a Standard seat
    * reports `default_raven`, a codename naming no published allotment. So the
    * rate-limit tier can size neither kind of Team seat: one because it lies
-   * and one because it says nothing. Null on every personal account.
+   * and one because it says nothing. Null on every personal account; a
+   * reading keeps that null so a seat the account no longer holds is cleared.
    */
-  seatTier?: string
+  seatTier?: string | null
 }
 
 /**
@@ -79,21 +80,21 @@ export function extractPlanFields(profile: OAuthProfileResponse | null | undefin
   return {
     ...(subscriptionType ? { subscriptionType } : {}),
     ...(rateLimitTier ? { rateLimitTier } : {}),
-    ...(seatTier ? { seatTier } : {}),
+    ...(seatTier || seatTier === null ? { seatTier } : {}),
   }
 }
 
 /**
  * Whether a stored credential is still missing plan information.
  *
- * Either field being absent counts, because they answer different questions
- * and arrive from different writers: `claude login` records `subscriptionType`
- * but not always `rateLimitTier`, and only `rateLimitTier` distinguishes Max 5x
- * from Max 20x. Requiring both means a file half-filled by the CLI still gets
- * completed.
+ * Personal Max needs its rate-limit tier to distinguish 5x from 20x. Team
+ * needs its seat tier instead: a Premium seat reports the same rate-limit
+ * tier as personal Max 5x, so family plus rate tier is still incomplete.
  */
 export function planFieldsMissing(fields: OAuthPlanFields | null | undefined): boolean {
-  return !fields?.subscriptionType || (!fields?.rateLimitTier && !fields?.seatTier)
+  if (!fields?.subscriptionType) return true
+  if (fields.subscriptionType === "team") return !fields.seatTier
+  return !fields.rateLimitTier && !fields.seatTier
 }
 
 /**
@@ -101,10 +102,10 @@ export function planFieldsMissing(fields: OAuthPlanFields | null | undefined): b
  * fails its caller: a profile whose plan is unknown is strictly better than no
  * profile at all, and every consumer already treats it as optional.
  */
-export async function fetchOAuthPlanFields(accessToken: string): Promise<OAuthPlanFields> {
+export async function fetchOAuthPlanFields(accessToken: string, fetchFn: typeof fetch = fetch): Promise<OAuthPlanFields> {
   let response: Response
   try {
-    response = await fetch(OAUTH_PROFILE_URL, {
+    response = await fetchFn(OAUTH_PROFILE_URL, {
       headers: {
         Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",

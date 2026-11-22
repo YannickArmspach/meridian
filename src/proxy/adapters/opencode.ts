@@ -61,13 +61,38 @@ function isTransientUserPromptHook(block: unknown): boolean {
   })
 }
 
+/**
+ * NOTE: OpenCode-specific (oh-my-openagent plugin). When OpenCode's message
+ * list ends on an assistant message, oh-my-openagent pushes a synthetic user
+ * turn with exactly this text: on every tool round after a compaction
+ * auto-continue, and on every tool round for model families that reject an
+ * assistant prefill. OpenCode keeps a completed tool round inside that
+ * assistant message, so on the wire the text lands as an extra block after the
+ * tool results of the trailing user slot. It is never persisted: the next
+ * request adds it again after the new tail only, and the earlier slot comes
+ * back without it. Hashing it made that slot look edited on every round, so
+ * each round replayed the whole conversation into a fresh SDK session.
+ */
+const PREFILL_RECOVERY_TEXT = "[internal] Continue from the previous assistant state."
+
+function isTransientPrefillRecovery(block: unknown): boolean {
+  return isRecord(block) && block.type === "text" && block.text === PREFILL_RECOVERY_TEXT
+}
+
 export function canonicalizeOpenCodeMessagesForLineage(
   messages: Array<{ role: string; content: unknown }>,
 ): Array<{ role: string; content: unknown }> {
   // Preserve message positions exactly; only block content may be filtered.
   return messages.map((message) => {
     if (message.role !== "user" || !Array.isArray(message.content)) return message
-    const content = message.content.filter((block) => !isTransientUserPromptHook(block))
+    let content = message.content.filter((block) => !isTransientUserPromptHook(block))
+    // Recognize the actual wire shape: completed tool results followed by one
+    // synthetic recovery block. Preserve the wording when it is embedded in
+    // a user's meaningful follow-up or appears before the tool results.
+    if (content.length > 1 && isTransientPrefillRecovery(content.at(-1))
+      && content.slice(0, -1).every((block) => isRecord(block) && block.type === "tool_result")) {
+      content = content.slice(0, -1)
+    }
     // A hook-only message has no durable identity. Retain it rather than
     // collapsing distinct requests to the same empty hash.
     if (content.length === 0 || content.length === message.content.length) return message
@@ -146,7 +171,12 @@ export const openCodeAdapter: AgentAdapter = {
       return undefined
     }
     const attestation = verifyPriorityAttestation(c.req.header(PRIORITY_ATTESTATION_HEADER))
-    if (!attestation || attestation.sessionId !== sessionId || attestation.agentId !== agentId) {
+    if (
+      !attestation
+      || attestation.generation === "pi1"
+      || attestation.sessionId !== sessionId
+      || attestation.agentId !== agentId
+    ) {
       return undefined
     }
     return {
@@ -155,7 +185,7 @@ export const openCodeAdapter: AgentAdapter = {
       issuedAt: attestation.issuedAt,
       generation: attestation.generation === "oc1"
         ? "opencode-v1"
-        : "opencode-v2-beta-18314",
+        : attestation.generation === "oc2b18314" ? "opencode-v2-beta-18314" : "opencode-v2-2.0.16",
     }
   },
 

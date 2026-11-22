@@ -14,7 +14,7 @@ export interface AdapterFeatures {
   codeSystemPrompt: boolean
   /** Include the client agent's system prompt (e.g. OpenCode/Crush instructions) */
   clientSystemPrompt: boolean
-  /** Load CLAUDE.md instruction files (off, project, full) */
+  /** Load host CLAUDE.md files for SDK-owned tools; ignored in client-owned passthrough. */
   claudeMd: "off" | "project" | "full"
   /** Enable auto-memory (read + write across sessions) */
   memory: boolean
@@ -99,6 +99,12 @@ const ADAPTER_DEFAULTS: Record<string, Partial<AdapterFeatures>> = {
   // Jcode supplies its own coding-agent instructions over the generic
   // OpenAI-compatible endpoint, so the Claude Code preset stays off.
   jcode: {
+    codeSystemPrompt: false,
+  },
+  // Letta Code ships its own harness prompt over the generic
+  // OpenAI-compatible endpoint; keep the ~28KB Claude Code preset off, same
+  // rationale as openai/jcode.
+  letta: {
     codeSystemPrompt: false,
   },
   // Cherry Studio is a chat client that brings its own system prompt. Default

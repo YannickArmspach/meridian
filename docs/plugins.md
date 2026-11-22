@@ -46,7 +46,7 @@ opt-in plugins instead:
 | [`@rynfar/meridian-plugin-opencode-scrub`](https://github.com/rynfar/meridian-plugin-opencode-scrub) | Strips OpenCode harness boilerplate from the system prompt before it reaches Claude. |
 | [`@rynfar/meridian-plugin-openclaw-scrub`](https://github.com/rynfar/meridian-plugin-openclaw-scrub) | Removes OpenClaw prompt fingerprints, output directives and stale heartbeat replay. |
 
-**Nix users:** the flake packages hermes-scrub, pi-scrub and opencode-scrub prebuilt — `pkgs.meridianPlugins.<name>` via the `meridian` overlay (or `meridian.legacyPackages.${system}.meridianPlugins`), each exposing `.path` for a `plugins.json` entry or the home-manager `pluginConfig` option. Pins are refreshed by a scheduled workflow that rebuilds every plugin before bumping. openclaw-scrub is not in the flake yet — add it as a `meridian-plugin-openclaw-scrub` input (the packaging is generic; it is picked up by prefix) and relock.
+**Nix users:** the flake packages hermes-scrub, pi-scrub and opencode-scrub prebuilt — `pkgs.meridianPlugins.<name>` via the `meridian` overlay (or `meridian.legacyPackages.${system}.meridianPlugins`), each exposing `.path` for a `plugins.json` entry or the home-manager `pluginConfig` option. Each follows its plugin's release tags, and a scheduled `nix-update` workflow bumps them, rebuilding every plugin before opening a PR. openclaw-scrub is not in the flake yet — add it as `nix/pkgs/meridianPlugins/openclaw-scrub/package.nix`, following the other plugins.
 
 Everyone else: install into Meridian's config dir and register the built file in
 `~/.config/meridian/plugins.json`:
@@ -67,7 +67,7 @@ npm install @rynfar/meridian-plugin-hermes-scrub
 
 Use absolute paths for npm packages. Bare filenames are resolved in the plugin discovery directory; the loader does not expand `~`.
 
-Both plugin locations are configurable for the standalone CLI: `MERIDIAN_PLUGIN_DIR` overrides the auto-discovery directory and `MERIDIAN_PLUGIN_CONFIG` the manifest path (useful for Nix, containers, or running several instances with different plugin sets).
+Both plugin locations live in Meridian's config directory, so an instance started with its own `MERIDIAN_CONFIG_DIR` reads its own `plugins/` and `plugins.json`. For the standalone CLI, `MERIDIAN_PLUGIN_DIR` overrides the auto-discovery directory and `MERIDIAN_PLUGIN_CONFIG` the manifest path (useful for Nix or containers).
 
 The metering and failure observations behind these scrubbers are historical and account-specific. A prompt rewrite cannot guarantee subscription eligibility or avoid a genuine quota limit.
 

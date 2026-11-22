@@ -22,7 +22,7 @@ COPY examples/opencode-plugin/antigravity-retry.js ./antigravity-clients/opencod
 # Run bun build directly (not "bun run build") to skip postbuild hook,
 # which calls "node --check" — unavailable in oven/bun image
 RUN rm -rf dist \
-    && bun build bin/cli.ts src/proxy/server.ts plugin/meridian-v2.ts --outdir dist --target node --splitting --external @anthropic-ai/claude-agent-sdk --external libsql --external jsonc-parser --entry-naming '[name].js' \
+    && bun build bin/cli.ts bin/session-bookkeeping.ts src/proxy/server.ts plugin/meridian-v2.ts --outdir dist --target node --splitting --external @anthropic-ai/claude-agent-sdk --external libsql --external jsonc-parser --entry-naming '[name].js' \
     && bun build plugin/meridian-v2/index.js --outdir dist/meridian-v2 --target node --splitting --external @anthropic-ai/claude-agent-sdk --external libsql --external jsonc-parser --entry-naming '[name].js' \
     && cp plugin/meridian-v2/package.json dist/meridian-v2/package.json \
     && cp -r antigravity-clients dist/antigravity-clients
@@ -68,8 +68,10 @@ RUN chmod +x ./bin/docker-entrypoint.sh ./bin/claude-proxy-supervisor.sh ./bin/d
 
 EXPOSE 3456
 
+# /livez, not /health: /health is 503 for a logged-out account, and an
+# orchestrator's restart loop cannot log it back in (#1472).
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD node -e "const r=await fetch('http://127.0.0.1:3456/health');process.exit(r.ok?0:1)"
+    CMD node -e "const r=await fetch('http://127.0.0.1:3456/livez');process.exit(r.ok?0:1)"
 
 ENV CLAUDE_PROXY_PASSTHROUGH=1 \
     CLAUDE_PROXY_HOST=0.0.0.0 \

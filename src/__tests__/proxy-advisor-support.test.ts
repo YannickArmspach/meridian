@@ -8,7 +8,7 @@
  *   - Non-advisor requests unaffected
  */
 
-import { describe, it, expect, mock, beforeEach } from "bun:test"
+import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
@@ -51,9 +51,17 @@ installMcpToolsMock(() => ({
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 
+// A proxy's opportunistic session GC outlives the request that started it;
+// closing the backend joins it, so it cannot sweep the next test file's store.
+const proxies: Array<ReturnType<typeof createProxyServer>> = []
+afterEach(async () => {
+  await Promise.all(proxies.splice(0).map(proxy => proxy.closeBackend?.()))
+})
+
 function createTestApp() {
-  const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
-  return app
+  const proxy = createProxyServer({ port: 0, host: "127.0.0.1" })
+  proxies.push(proxy)
+  return proxy.app
 }
 
 async function post(
@@ -88,10 +96,10 @@ const BASE_BODY = {
 }
 
 describe("Advisor tool — SDK option passthrough", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     capturedOptions = {}
     mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   it("passes advisorModel to SDK when advisor tool is in request", async () => {
@@ -139,10 +147,10 @@ describe("Advisor tool — SDK option passthrough", () => {
 })
 
 describe("Advisor response — stop_reason preservation", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     capturedOptions = {}
     mockMessages = []
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   it("preserves pause_turn stop_reason in non-streaming response", async () => {

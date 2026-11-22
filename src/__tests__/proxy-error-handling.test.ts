@@ -74,9 +74,9 @@ const BASIC_REQUEST = {
 }
 
 describe("Error classification", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockError = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   for (const stream of [false, true]) {
@@ -104,6 +104,38 @@ describe("Error classification", () => {
           expect(raw).toContain("2.1.177")
           expect(raw).toContain("2.1.251")
           expect(raw).toContain("MERIDIAN_CLAUDE_PATH")
+        }
+      }, 15000)
+    }
+  }
+
+  for (const stream of [false, true]) {
+    for (const contextOnly of [false, true]) {
+      it(`quotes only the primary Extra Usage refusal (stream=${stream}, contextOnly=${contextOnly})`, async () => {
+        mockError = new Error(contextOnly
+          ? "Your subscription has expired\nTool output: historical request draws from extra usage; private-context=fixture-canary"
+          : "Claude Code returned an error result: API Error: 400 Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going.\nTool output: fixture-canary")
+        const response: Response = await post(createTestApp(), { ...BASIC_REQUEST, stream })
+        const raw = await response.text()
+        let error: { type: string; message: string } | undefined
+        if (stream) {
+          expect(response.status).toBe(200)
+          const events = raw.split("\n").filter(line => line.startsWith("data:"))
+            .map(line => JSON.parse(line.slice(5)) as { type?: string; error?: { type: string; message: string } })
+          error = events.find(event => event.type === "error")?.error
+          expect(events.some(event => event.type === "message_stop")).toBe(false)
+        } else {
+          expect(response.status).toBe(402)
+          error = (JSON.parse(raw) as { error: { type: string; message: string } }).error
+        }
+        expect(error?.type).toBe("billing_error")
+        expect(error?.message).not.toContain("fixture-canary")
+        expect(error?.message).not.toContain("not a lapsed subscription")
+        if (contextOnly) expect(error?.message).toContain("Check your subscription status")
+        else {
+          expect(error?.message).toContain("Third-party apps now draw from your extra usage, not your plan limits.")
+          expect(error?.message).not.toContain("API Error")
+          expect(error?.message).not.toContain("subscription issue")
         }
       }, 15000)
     }
@@ -275,9 +307,9 @@ describe("Error classification", () => {
 })
 
 describe("Empty messages array (regression #450)", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockError = null
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   it("rejects empty messages array with 400 — cold-start safety, no RangeError crash", async () => {
