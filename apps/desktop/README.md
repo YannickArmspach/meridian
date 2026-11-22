@@ -43,7 +43,12 @@ not install Electron or need the app.
 
 ## Connect to an existing installation
 
-Opening the app detects Meridian at `http://127.0.0.1:3456`. Settings accepts
+Opening the app (or **Re-detect**) finds the Meridian your clients use: loaded
+launchd jobs, then the OpenCode and Pi configurations, then
+`http://127.0.0.1:3456`, then the saved address. Only local addresses that answer
+as Meridian are attached, and the app then views that service instead of
+starting its own copy; the managed copy runs only when none is found. The app
+shows which instance it is viewing (address, version, supervisor). Settings accepts
 another local HTTP address and an optional API key, encrypted with Electron's
 secure storage. Docker works through its published local port; Nix, npm and
 other supervisors expose the same Meridian HTTP interface. Remote connections
@@ -67,7 +72,10 @@ requested in the UI.
 **Close window** keeps the service running in the menu bar. **Quit app** drains
 and stops its owned process. Unexpected child exits trigger up to three recovery
 attempts. Settings can start managed Meridian when the app opens; the packaged
-Mac app can also open at login.
+Mac app can also open at login. On macOS, enable **Settings → Background →
+Hide Dock icon** to keep the app exclusively in the menu bar. This applies
+immediately and persists across launches; the menu-bar controls still open the
+dashboard. Disable it to restore the Dock icon.
 
 Version activation drains the old child, starts the selected CLI, and rolls back
 the selection/process if startup fails. Installed older versions remain available
@@ -82,6 +90,22 @@ The handoff only considers direct, current-user, loopback CLI jobs
 with a sufficiently long drain timeout and unchanged plist. Its encrypted
 recovery journal is written before supervisor changes. Wrapper scripts,
 containers, system services and declarative installations stay externally owned.
+
+## Sign in to Claude accounts
+
+In **Usage & accounts**, give a new account a short name and choose **Continue
+to sign-in**, or use **Sign in** on an existing account. The sign-in panel names
+the account, prepares a browser link, and guides you through copying Claude’s
+authorization code back into Meridian. Check the account selected in your browser
+before authorizing. Meridian shows progress and a persistent success or retry
+result; cancelling does not report an authentication failure.
+
+For externally managed services, sign-in uses the service's own sign-in routes
+(paste the code Claude shows); older versions without them offer **Copy sign-in
+command** to run in Terminal on the service’s host. Removing a Claude account
+from an external service always needs that host's `meridian profile remove`. Return to the desktop and refresh after
+completing sign-in. Connecting to a service does not give the desktop ownership
+of its account files.
 
 ## Install scrub plugins
 

@@ -36,6 +36,7 @@ describe("independentRequestCause", () => {
     isSubagent: false,
     clientDrivenLoop: false,
     hasDurableKey: true,
+    isAuxiliary: false,
   }
 
   it("returns no cause for an ordinary keyed request", () => {
@@ -61,14 +62,34 @@ describe("independentRequestCause", () => {
       .toBe("no-cache-identity")
   })
 
-  // The invariant the guard is built on: an explicit key cannot collide, so a
-  // keyed fork or subagent resumes normally. Losing this re-broke pylon's
-  // long-lived workers once already (they fresh-replayed every turn).
+  // A keyed fork or subagent resumes normally: distinct flows carry distinct
+  // keys, so the key alone proves the request cannot collide. Losing this
+  // re-broke pylon's long-lived workers once already (they fresh-replayed
+  // every turn).
   it("lets an explicit key override the fork and subagent guards", () => {
     expect(independentRequestCause({ ...base, hasSessionKey: true, forkSource: true }))
       .toBeUndefined()
     expect(independentRequestCause({ ...base, hasSessionKey: true, isSubagent: true }))
       .toBeUndefined()
+  })
+
+  // The one exception. An adapter-declared auxiliary request shares the main
+  // conversation's key BY PROTOCOL (Claude Code's auto-mode classifier sends
+  // the conversation's own session id), so the key cannot vouch for it.
+  it("does not let a session key override an auxiliary request", () => {
+    expect(independentRequestCause({ ...base, hasSessionKey: true, isAuxiliary: true }))
+      .toBe("auxiliary-request")
+  })
+
+  it("reports auxiliary-request ahead of every other cause", () => {
+    expect(independentRequestCause({
+      ...base,
+      isAuxiliary: true,
+      forkSource: true,
+      isSubagent: true,
+      clientDrivenLoop: true,
+      hasDurableKey: false,
+    })).toBe("auxiliary-request")
   })
 
   // `isClientDrivenLoop` already requires a headerless request, so a session
@@ -105,6 +126,8 @@ describe("formatDivergence", () => {
       .toBe("independent-request:headerless-tool-result")
     expect(formatDivergence({ type: "diverged", reason: "modified-history" }, "headerless-tool-result"))
       .toBe("modified-history")
+    expect(formatDivergence({ type: "diverged", reason: "independent-request" }, "auxiliary-request"))
+      .toBe("independent-request:auxiliary-request")
   })
 
   it("still names independent-request when no cause was supplied", () => {
@@ -148,13 +171,13 @@ describe("classifyLineage names the rejections that were silent", () => {
     store = await import("../proxy/sessionStore")
     dir = mkdtempSync(join(tmpdir(), "meridian-divergence-reason-"))
     store.setSessionStoreDir(dir, { skipLocking: false })
-    cache.clearSessionCache()
+    await cache.clearSessionCache()
     errSpy = spyOn(console, "error")
   })
 
-  afterEach(() => {
+  afterEach(async () => {
     errSpy.mockRestore()
-    cache.clearSessionCache()
+    await cache.clearSessionCache()
     store.setSessionStoreDir(null)
     rmSync(dir, { recursive: true, force: true })
   })
@@ -162,31 +185,31 @@ describe("classifyLineage names the rejections that were silent", () => {
   const lines = (): string[] => errSpy.mock.calls.map((c: any) => String(c[0]))
   const notResumable = () => lines().find((l: string) => l.includes("Session not resumable"))
 
-  it("names a replayed request", () => {
+  it("names a replayed request", async () => {
     const messages = [{ role: "user", content: "hello" }]
-    cache.storeSession("key-replay", messages, "sdk-a")
+    await cache.storeSession("key-replay", messages, "sdk-a")
     expect(cache.lookupSession("key-replay", messages).type).toBe("diverged")
     expect(notResumable()).toContain("reason=replayed-request")
     expect(notResumable()).toContain("incoming 1 msgs")
   })
 
-  it("names an unrelated history", () => {
-    cache.storeSession("key-unrelated", [{ role: "user", content: "first conversation" }], "sdk-b")
+  it("names an unrelated history", async () => {
+    await cache.storeSession("key-unrelated", [{ role: "user", content: "first conversation" }], "sdk-b")
     const result = cache.lookupSession("key-unrelated", [{ role: "user", content: "different conversation" }])
     expect(result.type).toBe("diverged")
     expect(notResumable()).toContain("reason=unrelated-history")
   })
 
-  it("names an entry that cannot prove what it holds", () => {
-    cache.storeSession("key-unverifiable", [], "sdk-c")
+  it("names an entry that cannot prove what it holds", async () => {
+    await cache.storeSession("key-unverifiable", [], "sdk-c")
     const result = cache.lookupSession("key-unverifiable", [{ role: "user", content: "anything" }])
     expect(result.type).toBe("diverged")
     expect(notResumable()).toContain("reason=unverifiable")
   })
 
-  it("keeps the existing wording for a history rewrite", () => {
+  it("keeps the existing wording for a history rewrite", async () => {
     const stored = [{ role: "user", content: "a" }, { role: "assistant", content: "b" }]
-    cache.storeSession("key-modified", stored, "sdk-d")
+    await cache.storeSession("key-modified", stored, "sdk-d")
     const rewritten = [{ role: "user", content: "a" }, { role: "assistant", content: "CHANGED" },
       { role: "user", content: "c" }]
     expect(cache.lookupSession("key-modified", rewritten).type).toBe("diverged")
@@ -204,9 +227,9 @@ describe("classifyLineage names the rejections that were silent", () => {
     expect(notResumable()).toBeUndefined()
   })
 
-  it("leaks no message content", () => {
+  it("leaks no message content", async () => {
     const secret = "SUPER-SECRET-PROMPT-TEXT"
-    cache.storeSession("key-secret", [{ role: "user", content: secret }], "sdk-e")
+    await cache.storeSession("key-secret", [{ role: "user", content: secret }], "sdk-e")
     cache.lookupSession("key-secret", [{ role: "user", content: secret }])
     expect(notResumable()).toBeDefined()
     expect(notResumable()).not.toContain(secret)

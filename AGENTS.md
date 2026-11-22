@@ -6,10 +6,14 @@ Meridian bridges supported coding clients to Claude through the Agent SDK and to
 
 Continue authorized implementation through relevant verification, corrections, and a PR. Preserve the user's checkout; use an isolated feature branch from current `origin/main`. Do not push directly to main. An instruction cleanup or typo fix does not start the contributor backlog, run live model calls, or publish a release.
 
+- The spec graph is the ground truth for intent and boundaries: `goal-and-requirements.md` (root), `ARCHITECTURE.md`, `DESIGN.md`, the [API contract](.agents/references/api-contract.md) and one spec per module, listed with paths in the *Module specs* table of `ARCHITECTURE.md`. Read the spec that owns the area before changing it; a change that alters a boundary, contract, invariant or decision updates that spec in the same PR. Record rationale there, not in code comments.
 - Use `ARCHITECTURE.md` for module and dependency changes, `DESIGN.md` for user-facing UI/brand changes, and `E2E.md` for affected-client live verification.
-- Use [meridian-upstream-review](.agents/skills/meridian-upstream-review/SKILL.md) for contributor review/incorporation or authorized release work. Read `docs/maintenance/REVIEW_HANDOFF.md` only when continuing that work; refresh live GitHub status before relying on a dated checkpoint.
-- For commits/PRs/merges, use [contribution workflow](.agents/references/contributing.md). Normal PRs squash with `--match-head-commit`; Release Please PRs merge with `--merge`. Required final-head CI, including `test`, remains a merge gate. Never bypass checks routinely.
+- Use [meridian-upstream-review](.agents/skills/meridian-upstream-review/SKILL.md) for contributor review or authorized release work. Read `docs/maintenance/REVIEW_HANDOFF.md` only when continuing that work; refresh live GitHub status before relying on a dated checkpoint.
+- Use [meridian-backlog](.agents/skills/meridian-backlog/SKILL.md) for an authorized PR/issue queue across Meridian and the owner's scrub repositories. Use [meridian-evidence](.agents/skills/meridian-evidence/SKILL.md) for adversarial review and proof of a fix, merge, or release.
+- A contributor's change lands through their own PR, with their Git `Author` credit on `main`. The narrowly defined [forwarded contributions](.agents/references/contributing.md#forwarded-contributions) route preserves every existing author commit in an already-open forwarded PR. Never carry their commits into a maintainer PR, and never close their PR silently or for work that shipped.
+- For commits/PRs/merges, use [contribution workflow](.agents/references/contributing.md). Normal PRs squash with `--match-head-commit`; qualified forwarded contributions and Release Please PRs use `--merge`. Required final-head CI, including `test`, remains a merge gate. Never bypass checks routinely.
 - External comments/messages need explicit authorization. Release authorization is separate from completing a change. Never manually run `npm version`, push tags, or `npm publish`; use the release reference in the review skill.
+- Adversarially review every proposed PR and release before landing it. Record the concrete product-fit, regression, and evidence findings in its PR or review handoff; fix material findings before merge.
 
 ## Engineering boundaries
 
@@ -18,6 +22,8 @@ Keep `server.ts` focused on orchestration. `session/lineage.ts` is pure: no I/O 
 Keep agent-specific logic in the adapter boundary. When changing existing special cases, consult the Agent-Specific Logic section of `ARCHITECTURE.md`, retain useful `NOTE:` markers, and avoid spreading them into unrelated modules. Do not use `as any`, `@ts-ignore`, `@ts-expect-error`, or empty catch blocks.
 
 Public plugin interfaces require owner approval and an issue before modification; an existing explicit request covering the change supplies approval. Consult [API contract](.agents/references/api-contract.md) when touching exported proxy configuration/lifecycle, session/profile headers, health, messages or profile routes. Internal fixes that preserve these interfaces do not require new approval.
+
+Changes to `flake.nix`, anything under `nix/`, or the dependencies in `package.json` and `bun.lock` follow [Nix packaging](.agents/references/nix-packaging.md). A dependency change also updates the hash in `nix/pkgs/meridian/node_modules.nix`, and raising the `@anthropic-ai/claude-code` floor also runs `nix/pkgs/claude-code/update.sh`.
 
 UI uses `DESIGN.md`, color tokens from `themeCss` in `src/telemetry/profileBar.ts`, and the shared `profileBarCss/Html/Js` header. Pages do not set their own body background. Blue `--accent` means interactive/active; violet `--accent2` means code/meta/secondary brand.
 
@@ -28,3 +34,7 @@ UI uses `DESIGN.md`, color tokens from `themeCss` in `src/telemetry/profileBar.t
 Choose focused checks during iteration and fix failures caused by the change. For code changes, the final local gates are `npm test`, typecheck and build. Documentation/instruction-only changes need content, link and diff validation, not model calls or an application rebuild. Required CI still applies before merge.
 
 Cover meaningful extracted behavior with direct pure-function tests or HTTP integration tests through the mocked SDK; tests live in `src/__tests__/`. Every accepted product behavior change and release requires affected-flow live E2E using the actual implicated model, SDK, client and platform. Use `E2E.md`; mocks, another platform/model, or an unexplained green rerun cannot establish that the reported problem is fixed. Preserve missing evidence explicitly and continue any independent work.
+
+Every actual OpenCode live test through Meridian's Claude path, including a login or model-access diagnostic, must use the Meridian OpenCode plugin for the tested client generation. Follow the [mandatory plugin preflight](E2E.md#required-meridian-opencode-plugin-preflight), preserve its configuration and runtime witnesses, and include this requirement in delegated test briefs. Verify the plugin and request route before attributing a refusal to credentials or asking the owner to log in again.
+
+For critical fixes, escrow a reproducible headless E2E harness in the affected repository or the integration repository that owns the real client path, even if real credentials keep it out of CI; if infeasible, attach the exact sanitized script as a durable PR/CI artifact and record the missing repository test as a follow-up gate. Retain a durable before/after evidence record beyond a temporary local path. Capture short video for visual or timing behavior when it helps review; keep secrets out of logs and media.

@@ -12,20 +12,43 @@
  *   anthropic-beta: oauth-2025-04-20
  *
  * We reuse `tokenRefresh.ts`'s cross-platform credential store (macOS Keychain
- * or `~/.claude/.credentials.json`) to read the access token, and trigger a
- * background refresh on 401.
+ * or `~/.claude/.credentials.json`) to read the access token. We refresh it on
+ * 401, before the call when it has expired, and once after a run of 429s
+ * (reports say the endpoint rate-limits per access token, so a new token gets a
+ * new bucket).
  *
- * Per-profile caching: each profile has its own 30s TTL cache so multi-account
- * setups can be queried independently without cross-contamination. Concurrent
- * callers for the same profile share a single in-flight request.
+ * Per-profile caching: each profile has its own TTL cache (30s by default,
+ * `MERIDIAN_USAGE_CACHE_TTL_MS`) so multi-account setups can be queried
+ * independently without cross-contamination. Concurrent callers for the same
+ * profile share a single in-flight request.
  */
 
+import { createHash } from "node:crypto"
+import { z } from "zod"
 import { claudeLog } from "../logger"
+import { envIntValue } from "../env"
+import { isCredentialsReadOnly } from "./credentialsMode"
 import { parseRetryAfterMs } from "./retryAfter"
 import { createPlatformCredentialStore, refreshOAuthToken, type CredentialStore } from "./tokenRefresh"
+import { followedUsageSnapshot } from "./followUsage"
+import { bundledClaudeCodeVersion } from "./models"
 
-const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+// Policy for the query flag and User-Agent: profiles-routing.spec.md, "OAuth usage request identity".
+const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1"
 const OAUTH_BETA_HEADER = "oauth-2025-04-20"
+const OAUTH_USER_AGENT_FALLBACK_VERSION = "2.1.304"
+const CLAUDE_CODE_VERSION_FORMAT = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/
+let oauthUserAgentValue: string | undefined
+
+/** The Claude Code client identity sent on every OAuth usage, identity and reset request. */
+export function oauthUserAgent(): string {
+  if (oauthUserAgentValue === undefined) {
+    const bundled = bundledClaudeCodeVersion()
+    const version = bundled && CLAUDE_CODE_VERSION_FORMAT.test(bundled) ? bundled : OAUTH_USER_AGENT_FALLBACK_VERSION
+    oauthUserAgentValue = `claude-cli/${version} (external, cli)`
+  }
+  return oauthUserAgentValue
+}
 
 /** Raw shape returned by Anthropic. Most fields are optional/nullable. */
 interface RawOAuthWindow {
@@ -35,10 +58,15 @@ interface RawOAuthWindow {
 
 interface RawOAuthExtraUsage {
   is_enabled?: boolean
-  monthly_limit?: number
-  used_credits?: number
+  /** Minor units (cents for USD): 500 is $5.00. */
+  monthly_limit?: number | null
+  /** Minor units, like `monthly_limit`. */
+  used_credits?: number | null
+  /** 0..100, clamped by Anthropic at 100 even when used exceeds the limit. */
   utilization?: number | null
-  currency?: string
+  currency?: string | null
+  /** Decimal places of the minor unit; absent on some responses. */
+  decimal_places?: number | null
 }
 
 interface RawOAuthLimit {
@@ -65,6 +93,7 @@ interface RawOAuthUsageResponse {
   omelette_promotional?: RawOAuthWindow | null
   limits?: RawOAuthLimit[] | null
   extra_usage?: RawOAuthExtraUsage | null
+  cedar_ember?: unknown
 }
 
 export interface OAuthUsageWindow {
@@ -75,15 +104,45 @@ export interface OAuthUsageWindow {
 
 export interface OAuthExtraUsageInfo {
   isEnabled: boolean
+  /** Major units of `currency` (dollars for USD). */
   monthlyLimit: number
+  /** Major units; may exceed `monthlyLimit`, since a turn can overshoot it. */
   usedCredits: number
   utilization: number | null
   currency: string
+  /**
+   * Decimal places applied to Anthropic's minor-unit amounts. Its presence
+   * tells a consumer that `monthlyLimit` and `usedCredits` are major units:
+   * Meridian versions without this field served the minor units under the
+   * same names.
+   */
+  exponent: number
+}
+
+export interface OAuthBankedResetGrant {
+  id: string | null
+  resetsLeft: number
+  expiresAt: number | null
+  /** Epoch ms the grant becomes usable, or null when absent/unreadable. */
+  startsAt: number | null
+  /** Provider's flags; null when absent or not a boolean. */
+  paused: boolean | null
+  usableNow: boolean | null
+}
+
+export interface OAuthBankedResets {
+  eligible: boolean
+  /** Provider's reason the account is ineligible, or null when absent/unreadable. */
+  ineligibleReason: string | null
+  /** The grant the provider would redeem next; null unless it names a listed grant. */
+  nextGrantId: string | null
+  grants: OAuthBankedResetGrant[]
 }
 
 export interface OAuthUsageSnapshot {
   windows: OAuthUsageWindow[]
   extraUsage: OAuthExtraUsageInfo | null
+  bankedResets: OAuthBankedResets | null
   fetchedAt: number
   /** Set when this is a previous snapshot served because a fresh fetch
    *  failed transiently (credential-read blip, upstream error). */
@@ -148,6 +207,7 @@ export interface OAuthUsageResult extends RawUsageResult {
 export interface UsageEntryFields {
   windows: OAuthUsageWindow[]
   extraUsage: OAuthExtraUsageInfo | null
+  bankedResets: OAuthBankedResets | null
   fetchedAt: number | null
   /** True when the figures are a previous reading rather than one taken by the
    *  check that just ran. */
@@ -174,6 +234,7 @@ export function toUsageEntry(result: OAuthUsageResult): UsageEntryFields {
   return {
     windows: shown?.windows ?? [],
     extraUsage: shown?.extraUsage ?? null,
+    bankedResets: shown?.bankedResets ?? null,
     fetchedAt: shown?.fetchedAt ?? null,
     stale: shown != null && (result.snapshot === null || result.snapshot.stale === true),
     error: result.error,
@@ -181,18 +242,45 @@ export function toUsageEntry(result: OAuthUsageResult): UsageEntryFields {
   }
 }
 
+// The cache lifetime unforced reads use; `MERIDIAN_USAGE_CACHE_TTL_MS` can
+// raise it, never lower it. While anything polls `/v1/usage/quota/all`
+// steadily, every read past the TTL reaches Anthropic, so the TTL sets the
+// upstream rate per profile. Anthropic answers 429 to a token read about every
+// 30–60 s for a few minutes, so a setup with many polling clients can raise it.
 const CACHE_TTL_MS_DEFAULT = 30_000
+// A longer cache would keep showing figures for a login that has since expired
+// or been revoked.
+const CACHE_TTL_MS_MAX = 5 * 60_000
 // A transiently failing fetch serves the last-good snapshot instead of
 // blanking the consumer ("no usage data yet" flapping) — but only within
 // this bound, so genuinely dead credentials still surface as missing data.
 const STALE_MAX_MS_DEFAULT = 15 * 60_000
 const RATE_LIMIT_BACKOFF_MS_DEFAULT = 60_000
+// Refresh this close to `expiresAt` rather than send a token the endpoint is
+// about to reject. The background scheduler normally renews first, so this is
+// a backup for a renewal it missed (a timer that fired late after sleep, or a
+// failed refresh before its retry). An expired token has drawn 429s from this
+// endpoint, not 401s, so the 401 path alone does not cover it.
+const EXPIRY_REFRESH_MARGIN_MS = 60_000
+// A community report on anthropics/claude-code#31021 says the usage endpoint
+// rate-limits per access token, so one token's bucket can stay full while a
+// new token reads fine (not measured here). After this many 429s in a row on
+// one token, refresh once to get a new token and a new bucket.
+const RATE_LIMIT_REFRESH_AFTER = 3
+// At most one 429-triggered refresh per profile in this window. A real rate
+// limit outlasts a new token, and each refresh rotates the refresh token, so
+// an unbounded retry would spend refresh grants for nothing.
+const RATE_LIMIT_REFRESH_WINDOW_MS = 60 * 60_000
 
 /** Per-profile cache. Key = profileId (or DEFAULT_KEY for the unscoped default). */
 const cacheByProfile = new Map<string, OAuthUsageSnapshot>()
 const inflightByProfile = new Map<string, Promise<RawUsageResult>>()
 const rateLimitedUntilByProfile = new Map<string, number>()
 const failureByProfile = new Map<string, OAuthUsageFailure>()
+/** The current run of 429s: which token drew them (a hash, never the token)
+ *  and how many in a row. */
+const rateLimitRunByProfile = new Map<string, { tokenHash: string; count: number }>()
+const lastRateLimitRefreshAtByProfile = new Map<string, number>()
 const DEFAULT_KEY = "__default__"
 
 function recordFailure(cacheKey: string, reason: OAuthUsageError): void {
@@ -226,6 +314,63 @@ function parseIsoToMs(raw: string | null | undefined): number | null {
   if (!raw) return null
   const ms = Date.parse(raw)
   return Number.isFinite(ms) ? ms : null
+}
+
+const RESET_DATE_FORMAT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$/i
+const RESET_DATE_TIMEZONE = /(?:Z|[+-]\d{2}:\d{2})$/i
+
+function parseResetDate(raw: unknown): number | null {
+  if (typeof raw !== "string" || !RESET_DATE_FORMAT.test(raw)) return null
+  // Provider timestamps without an offset are UTC, never the host's timezone.
+  return parseIsoToMs(RESET_DATE_TIMEZONE.test(raw) ? raw : `${raw}Z`)
+}
+
+const GRANT_ID_FORMAT = /^[a-z0-9_-]{1,40}$/
+const INELIGIBLE_REASON_FORMAT = /^[a-z0-9_]{1,64}$/
+
+function optionalBoolean(raw: object, key: string): boolean | null {
+  const value: unknown = key in raw ? Reflect.get(raw, key) : undefined
+  return typeof value === "boolean" ? value : null
+}
+
+function parseBankedResets(raw: unknown): OAuthBankedResets | null {
+  if (typeof raw !== "object" || raw === null || !("eligible" in raw) || typeof raw.eligible !== "boolean"
+    || !("grants" in raw) || !Array.isArray(raw.grants)) return null
+
+  const grants: OAuthBankedResetGrant[] = []
+  const rawGrants: unknown[] = raw.grants
+  for (const grant of rawGrants) {
+    if (typeof grant !== "object" || grant === null || !("resets_left" in grant)
+      || typeof grant.resets_left !== "number" || !Number.isSafeInteger(grant.resets_left) || grant.resets_left < 0) continue
+
+    grants.push({
+      id: "id" in grant && typeof grant.id === "string" ? grant.id : null,
+      resetsLeft: grant.resets_left,
+      expiresAt: parseResetDate("ends_at" in grant ? grant.ends_at : null),
+      startsAt: parseResetDate("starts_at" in grant ? grant.starts_at : null),
+      paused: optionalBoolean(grant, "paused"),
+      usableNow: optionalBoolean(grant, "usable_now"),
+    })
+  }
+  const next: unknown = "next_grant_id" in raw ? raw.next_grant_id : null
+  const reason: unknown = "ineligible_reason" in raw ? raw.ineligible_reason : null
+  return {
+    eligible: raw.eligible,
+    ineligibleReason: typeof reason === "string" && INELIGIBLE_REASON_FORMAT.test(reason) ? reason : null,
+    nextGrantId: typeof next === "string" && GRANT_ID_FORMAT.test(next) && grants.some(grant => grant.id === next) ? next : null,
+    grants,
+  }
+}
+
+/** Anthropic's minor unit is cents for USD; `decimal_places` names it when present. */
+const EXTRA_USAGE_DEFAULT_EXPONENT = 2
+
+function extraUsageExponent(raw: number | null | undefined): number {
+  return typeof raw === "number" && Number.isInteger(raw) && raw >= 0 && raw <= 4 ? raw : EXTRA_USAGE_DEFAULT_EXPONENT
+}
+
+function minorToMajor(amount: number | null | undefined, exponent: number): number {
+  return typeof amount === "number" && Number.isFinite(amount) ? amount / 10 ** exponent : 0
 }
 
 function normalizeUtilization(raw: number | null | undefined): number | null {
@@ -274,22 +419,73 @@ function buildSnapshot(raw: RawOAuthUsageResponse): OAuthUsageSnapshot {
   }
 
   const extra = raw.extra_usage
+  const exponent = extraUsageExponent(extra?.decimal_places)
   const extraUsage: OAuthExtraUsageInfo | null = extra
     ? {
         isEnabled: !!extra.is_enabled,
-        monthlyLimit: extra.monthly_limit ?? 0,
-        usedCredits: extra.used_credits ?? 0,
+        monthlyLimit: minorToMajor(extra.monthly_limit, exponent),
+        usedCredits: minorToMajor(extra.used_credits, exponent),
         utilization: normalizeUtilization(extra.utilization ?? null),
         currency: extra.currency ?? "USD",
+        exponent,
       }
     : null
 
-  return { windows, extraUsage, fetchedAt: Date.now() }
+  return { windows, extraUsage, bankedResets: parseBankedResets(raw.cedar_ember), fetchedAt: Date.now() }
 }
 
 async function readAccessToken(store: CredentialStore): Promise<string | null> {
   const creds = await store.read()
   return creds?.claudeAiOauth?.accessToken ?? null
+}
+
+type RefreshFn = (store: CredentialStore) => Promise<boolean>
+
+/** Refresh, then read back the new token. Null when either step fails. */
+async function refreshAndRead(store: CredentialStore, refresh: RefreshFn, cacheKey: string, trigger: string): Promise<string | null> {
+  if (await refresh(store)) {
+    const token = await readAccessToken(store)
+    if (token) return token
+  }
+  claudeLog("oauth_usage.refresh_failed", { profile: cacheKey, trigger })
+  return null
+}
+
+/**
+ * The token to send: the stored one, or a new one when the stored one has
+ * expired. A failed refresh still sends the stored token, so the call reports
+ * what upstream thinks of it (and a 401 takes its own refresh path).
+ *
+ * Read-only instances skip this quietly, as `ensureFreshToken` does: it runs
+ * on every check, and the instance that owns the credentials renews them.
+ */
+async function tokenForCall(store: CredentialStore, refresh: RefreshFn, cacheKey: string): Promise<string | null> {
+  const oauth = (await store.read())?.claudeAiOauth
+  const token = oauth?.accessToken ?? null
+  const expiresAt = oauth?.expiresAt
+  if (!token || typeof expiresAt !== "number" || expiresAt - Date.now() > EXPIRY_REFRESH_MARGIN_MS) return token
+  if (isCredentialsReadOnly()) return token
+  claudeLog("oauth_usage.refresh_on_expiry", { profile: cacheKey })
+  return (await refreshAndRead(store, refresh, cacheKey, "expiry")) ?? token
+}
+
+/** Count a 429 against the token that drew it. A new token starts a new run. */
+function countRateLimited(cacheKey: string, token: string): number {
+  const tokenHash = createHash("sha256").update(token).digest("hex")
+  const prev = rateLimitRunByProfile.get(cacheKey)
+  const count = prev?.tokenHash === tokenHash ? prev.count + 1 : 1
+  rateLimitRunByProfile.set(cacheKey, { tokenHash, count })
+  return count
+}
+
+/** Whether this 429 run may spend the profile's one refresh for the window.
+ *  Claims the window when it says yes, so a failed refresh counts too. */
+function claimRateLimitRefresh(cacheKey: string, runLength: number): boolean {
+  if (runLength < RATE_LIMIT_REFRESH_AFTER || isCredentialsReadOnly()) return false
+  const last = lastRateLimitRefreshAtByProfile.get(cacheKey)
+  if (last !== undefined && Date.now() - last < RATE_LIMIT_REFRESH_WINDOW_MS) return false
+  lastRateLimitRefreshAtByProfile.set(cacheKey, Date.now())
+  return true
 }
 
 /** Minimal fetch shape used by callAnthropic. Avoids `typeof fetch`'s
@@ -306,6 +502,7 @@ async function callAnthropic(
       Authorization: `Bearer ${token}`,
       "anthropic-beta": OAUTH_BETA_HEADER,
       Accept: "application/json",
+      "User-Agent": oauthUserAgent(),
     },
     signal: signal ?? AbortSignal.timeout(10_000),
   })
@@ -316,6 +513,31 @@ async function callAnthropic(
     }
   }
   return (await res.json()) as RawOAuthUsageResponse
+}
+
+type UsageCallResult = Awaited<ReturnType<typeof callAnthropic>>
+
+/**
+ * Count a 429 into its token's run; once the run is long enough and the
+ * profile's window allows it, refresh and retry once with the new token.
+ * Returns the result to report: the retry's, or the original 429. The caller
+ * applies the cooldown to whatever 429 comes back, so a failed refresh or a
+ * second 429 leaves the throttle as it was.
+ */
+async function retryAfterRateLimitRun(
+  limited: UsageCallResult,
+  ctx: { store: CredentialStore; refresh: RefreshFn; cacheKey: string; token: string; fetchImpl: FetchLike; owner: Promise<RawUsageResult> },
+): Promise<UsageCallResult> {
+  const runLength = countRateLimited(ctx.cacheKey, ctx.token)
+  if (!claimRateLimitRefresh(ctx.cacheKey, runLength)) return limited
+  claudeLog("oauth_usage.refresh_on_429", { profile: ctx.cacheKey, runLength })
+  const newToken = await refreshAndRead(ctx.store, ctx.refresh, ctx.cacheKey, "rate_limited")
+  if (!newToken || inflightByProfile.get(ctx.cacheKey) !== ctx.owner) return limited
+  const retried = await callAnthropic(newToken, ctx.fetchImpl)
+  if (inflightByProfile.get(ctx.cacheKey) !== ctx.owner) return retried
+  if ("__status" in retried && retried.__status === 429) countRateLimited(ctx.cacheKey, newToken)
+  else rateLimitRunByProfile.delete(ctx.cacheKey)
+  return retried
 }
 
 export interface FetchOAuthUsageOpts {
@@ -329,6 +551,202 @@ export interface FetchOAuthUsageOpts {
   profileId?: string | null
   claudeConfigDir?: string
   fetchImpl?: FetchLike
+  /** Override the token refresh (for testing). Defaults to refreshOAuthToken. */
+  refreshImpl?: RefreshFn
+}
+
+export const quotaResetBody = z.object({
+  profile: z.string().min(1),
+  grantId: z.string().regex(/^[a-z0-9_-]{1,40}$/),
+  requestId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
+}).strict()
+
+export type OAuthQuotaResetRequest = z.infer<typeof quotaResetBody>
+const quotaResetIdentity = z.object({ organization: z.object({ uuid: z.string().uuid() }) })
+
+const quotaResetOutcome = z.object({
+  result: z.enum(["reset", "already_used", "not_limited", "cooldown", "ineligible", "unavailable"]),
+  reason: z.unknown().optional(),
+  resets_left: z.unknown().optional(),
+  cleared: z.unknown().transform(raw => Array.isArray(raw) ? raw.filter((entry: unknown): entry is string => typeof entry === "string") : []).default([]),
+  weekly_resets_at: z.unknown().optional(),
+  cooldown_until: z.unknown().optional(),
+})
+
+export type OAuthResetFailureCode = "no_token" | "no_organization"
+  | "upstream_auth" | "rate_limited" | "upstream_error" | "invalid_response" | "reset_indeterminate"
+
+type OAuthResetFailure = {
+  ok: false
+  status: 429 | 502 | 503
+  code: OAuthResetFailureCode
+  message: string
+  indeterminate: boolean
+  /** The mutation POST was handed to fetch; its outcome is then tied to the request ID. */
+  dispatched: boolean
+}
+
+export type OAuthResetResult = OAuthResetFailure | {
+  ok: true
+  outcome: {
+    result: z.infer<typeof quotaResetOutcome>["result"]
+    reason: string | null
+    resetsLeft: number | null
+    cleared: string[]
+    weeklyResetsAt: number | null
+    cooldownUntil: number | null
+  }
+}
+
+function invalidateResetUsage(profileId?: string | null): void {
+  clearOAuthUsageForProfile(profileId)
+  if (profileId == null) clearOAuthUsageForProfile("default")
+}
+
+function fail(status: OAuthResetFailure["status"], code: OAuthResetFailureCode, message: string, indeterminate = false): OAuthResetFailure {
+  return { ok: false, status, code, message, indeterminate, dispatched: false }
+}
+
+function afterDispatch(failure: OAuthResetFailure): OAuthResetFailure {
+  return { ...failure, dispatched: true }
+}
+
+function httpFailure(status: number): OAuthResetFailure {
+  if (status === 401 || status === 403) return fail(502, "upstream_auth", "Upstream rejected OAuth credentials")
+  if (status === 429) return fail(429, "rate_limited", "Upstream rate limited the request")
+  return fail(502, "upstream_error", "Upstream request failed")
+}
+
+/** One explicit mutation; request IDs are caller-owned, not a promise of provider deduplication. */
+export async function redeemOAuthQuotaReset(
+  input: OAuthQuotaResetRequest,
+  opts?: Pick<FetchOAuthUsageOpts, "store" | "profileId" | "claudeConfigDir" | "fetchImpl" | "refreshImpl">,
+): Promise<OAuthResetResult> {
+  const fetchImpl = opts?.fetchImpl ?? globalThis.fetch
+  const store = opts?.store ?? createPlatformCredentialStore({ claudeConfigDir: opts?.claudeConfigDir })
+  let token: string | null
+  try {
+    token = await tokenForCall(store, opts?.refreshImpl ?? refreshOAuthToken, opts?.profileId ?? DEFAULT_KEY)
+  } catch {
+    return fail(503, "no_token", "Could not read OAuth credentials")
+  }
+  if (!token) return fail(503, "no_token", "No OAuth access token available")
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "anthropic-beta": OAUTH_BETA_HEADER,
+    "User-Agent": oauthUserAgent(),
+    "Content-Type": "application/json",
+  }
+  let organization: string
+  try {
+    const identity = await fetchImpl("https://api.anthropic.com/api/oauth/profile", {
+      headers, redirect: "error", signal: AbortSignal.timeout(25_000),
+    })
+    if (!identity.ok) return httpFailure(identity.status)
+    const profile = quotaResetIdentity.safeParse(await identity.json())
+    if (!profile.success) return fail(502, "no_organization", "OAuth identity did not include a valid organization")
+    organization = profile.data.organization.uuid
+  } catch {
+    return fail(502, "upstream_error", "Could not read OAuth organization")
+  }
+  try {
+    const response = await fetchImpl(`https://api.anthropic.com/api/organizations/${organization}/reset_rate_limits`, {
+      method: "POST", headers, redirect: "error", signal: AbortSignal.timeout(25_000),
+      body: JSON.stringify({ program: "cedar_ember", grant_id: input.grantId, request_id: input.requestId }),
+    })
+    if (!response.ok) {
+      if (response.status >= 500) {
+        invalidateResetUsage(opts?.profileId)
+        return afterDispatch(fail(502, "reset_indeterminate", "Reset outcome is unknown; do not automatically retry", true))
+      }
+      return afterDispatch(httpFailure(response.status))
+    }
+    let body: unknown
+    try {
+      body = await response.json()
+    } catch {
+      invalidateResetUsage(opts?.profileId)
+      return afterDispatch(fail(502, "invalid_response", "Reset response was invalid; outcome is unknown", true))
+    }
+    const result = quotaResetOutcome.safeParse(body)
+    if (!result.success) {
+      invalidateResetUsage(opts?.profileId)
+      return afterDispatch(fail(502, "invalid_response", "Reset response was invalid; outcome is unknown", true))
+    }
+    const value = result.data
+    if (value.result === "reset" || value.result === "already_used") invalidateResetUsage(opts?.profileId)
+    return { ok: true, outcome: {
+      result: value.result,
+      reason: typeof value.reason === "string" ? value.reason : null,
+      resetsLeft: typeof value.resets_left === "number" && Number.isSafeInteger(value.resets_left) && value.resets_left >= 0 ? value.resets_left : null,
+      cleared: value.cleared,
+      weeklyResetsAt: parseResetDate(value.weekly_resets_at),
+      cooldownUntil: parseResetDate(value.cooldown_until),
+    } }
+  } catch {
+    invalidateResetUsage(opts?.profileId)
+    return afterDispatch(fail(502, "reset_indeterminate", "Reset outcome is unknown; do not automatically retry", true))
+  }
+}
+
+const RESET_LEDGER_MAX_ENTRIES = 256
+const RESET_LEDGER_TTL_MS = 15 * 60_000
+/** Redemption currently running per ledger scope (profile). */
+const resetInflightByScope = new Map<string, { requestId: string; grantId: string }>()
+/** Settled, dispatched outcomes keyed by scope + request ID, oldest first. */
+const resetLedger = new Map<string, { grantId: string; result: OAuthResetResult; settledAt: number }>()
+
+function resetLedgerKey(scope: string, requestId: string): string {
+  return `${scope}\u0000${requestId}`
+}
+
+function pruneResetLedger(now: number): void {
+  for (const [key, entry] of resetLedger) {
+    if (now - entry.settledAt < RESET_LEDGER_TTL_MS && resetLedger.size <= RESET_LEDGER_MAX_ENTRIES) break
+    resetLedger.delete(key)
+  }
+}
+
+export type OAuthResetAttempt =
+  | { kind: "settled"; result: OAuthResetResult; replayed: boolean }
+  | { kind: "in_progress" }
+  | { kind: "request_id_conflict" }
+
+/**
+ * The route's entry point: at most one redemption per profile at a time, and a
+ * request ID whose mutation was dispatched replays its remembered outcome
+ * instead of reaching Anthropic again. See profiles-routing.spec.md.
+ */
+export async function redeemOAuthQuotaResetOnce(
+  input: OAuthQuotaResetRequest,
+  opts?: Parameters<typeof redeemOAuthQuotaReset>[1],
+): Promise<OAuthResetAttempt> {
+  const scope = input.profile
+  const key = resetLedgerKey(scope, input.requestId)
+  pruneResetLedger(Date.now())
+  const settled = resetLedger.get(key)
+  if (settled) {
+    return settled.grantId === input.grantId
+      ? { kind: "settled", result: settled.result, replayed: true }
+      : { kind: "request_id_conflict" }
+  }
+  const running = resetInflightByScope.get(scope)
+  if (running) {
+    return running.requestId === input.requestId && running.grantId !== input.grantId
+      ? { kind: "request_id_conflict" }
+      : { kind: "in_progress" }
+  }
+  resetInflightByScope.set(scope, { requestId: input.requestId, grantId: input.grantId })
+  try {
+    const result = await redeemOAuthQuotaReset(input, opts)
+    if (result.ok || result.dispatched) {
+      resetLedger.set(key, { grantId: input.grantId, result, settledAt: Date.now() })
+      pruneResetLedger(Date.now())
+    }
+    return { kind: "settled", result, replayed: false }
+  } finally {
+    resetInflightByScope.delete(scope)
+  }
 }
 
 /**
@@ -359,7 +777,9 @@ export function __setFetchOAuthUsageOverride(
  * Anthropic's endpoint when many clients poll concurrently. Concurrent
  * callers for the same profile share a single in-flight request.
  *
- * @param ttlMs           Override the cache TTL (default 30s).
+ * @param ttlMs           Override the cache TTL (default 30s, or
+ *                        `MERIDIAN_USAGE_CACHE_TTL_MS` when larger, at most
+ *                        5 minutes).
  * @param force           Bypass the TTL cache and fetch fresh. Does NOT bypass
  *                        the in-flight de-dupe or the 429 cooldown — both still
  *                        apply, so a forced caller can still get a stale (or
@@ -411,7 +831,7 @@ export async function fetchOAuthUsageResult(opts?: FetchOAuthUsageOpts): Promise
 }
 
 async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsageResult> {
-  const ttl = opts?.ttlMs ?? CACHE_TTL_MS_DEFAULT
+  const ttl = opts?.ttlMs ?? Math.min(CACHE_TTL_MS_MAX, Math.max(CACHE_TTL_MS_DEFAULT, envIntValue("USAGE_CACHE_TTL_MS") ?? 0))
   const cacheKey = opts?.profileId ?? DEFAULT_KEY
   const fetchImpl = opts?.fetchImpl ?? globalThis.fetch
   const staleMaxMs = opts?.staleMaxMs ?? STALE_MAX_MS_DEFAULT
@@ -423,7 +843,8 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
   // `attempted` marks a check that actually reached the credential store or
   // upstream. The 429 cooldown turns polls away before either, and those must
   // not advance the failure count — see OAuthUsageFailure.
-  const staleOr = (reason: string, error: OAuthUsageError, attempted = true): RawUsageResult => {
+  const staleOr = (reason: string, error: OAuthUsageError, attempted = true): RawUsageResult | Promise<RawUsageResult> => {
+    if (attempted && inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
     if (attempted) recordFailure(cacheKey, error)
     const last = cacheByProfile.get(cacheKey)
     if (last && Date.now() - last.fetchedAt < staleMaxMs) {
@@ -440,6 +861,23 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
   const existing = inflightByProfile.get(cacheKey)
   if (existing) return existing
 
+  // A followed instance's figures, when there is one. Taken before the
+  // credential read because the point is to make no upstream call at all:
+  // two instances polling the same account share one rate-limit budget, and
+  // the one that loses it gets 429 for every account it holds. Above the
+  // cooldown for the same reason: these figures cost the rate limit nothing,
+  // so a 429 this instance collected earlier must not suppress them.
+  // A forced read wants this account's figures now (a limit just hit, a new
+  // login), not a copy that may be minutes old.
+  const followed = opts?.force ? undefined : followedUsageSnapshot(opts?.profileId ?? "default")
+  if (followed) {
+    const local = cacheByProfile.get(cacheKey)
+    if (local && local.fetchedAt > followed.fetchedAt) return { snapshot: local, error: null }
+    cacheByProfile.set(cacheKey, followed)
+    failureByProfile.delete(cacheKey)
+    return { snapshot: followed, error: null }
+  }
+
   // A 429 must throttle forced and normal callers alike. Without a negative
   // cache, every quota poll retries immediately and can keep Anthropic's
   // private usage endpoint permanently rate-limited.
@@ -451,10 +889,12 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
 
   const store = opts?.store ?? createPlatformCredentialStore({ claudeConfigDir: opts?.claudeConfigDir })
   const rateLimitBackoffMs = opts?.rateLimitBackoffMs ?? RATE_LIMIT_BACKOFF_MS_DEFAULT
+  const refresh = opts?.refreshImpl ?? refreshOAuthToken
 
-  const promise = (async () => {
+  async function fetchAndCacheUsage(): Promise<RawUsageResult> {
     try {
-      const token = await readAccessToken(store)
+      let token = await tokenForCall(store, refresh, cacheKey)
+      if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
       if (!token) {
         // This read failing intermittently (e.g. a Keychain entry racing a
         // token-refresh rewrite) was previously silent — log it so flapping
@@ -464,9 +904,10 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
       }
 
       let result = await callAnthropic(token, fetchImpl)
+      if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
       if ("__status" in result && result.__status === 401) {
         claudeLog("oauth_usage.token_refresh_attempt", { profile: cacheKey })
-        const refreshed = await refreshOAuthToken(store)
+        const refreshed = await refresh(store)
         if (!refreshed) {
           claudeLog("oauth_usage.refresh_failed", { profile: cacheKey })
           // Not `no_token`: the token is present, and a read-only instance
@@ -477,9 +918,18 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
           return staleOr("refresh_failed", "upstream_error")
         }
         const newToken = await readAccessToken(store)
+        if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
         if (!newToken) return staleOr("no_token_after_refresh", "no_token")
+        token = newToken
         result = await callAnthropic(newToken, fetchImpl)
       }
+      if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
+      if ("__status" in result && result.__status === 429) {
+        result = await retryAfterRateLimitRun(result, { store, refresh, cacheKey, token, fetchImpl, owner: promise })
+      } else {
+        rateLimitRunByProfile.delete(cacheKey)
+      }
+      if (inflightByProfile.get(cacheKey) !== promise) return fetchOAuthUsageImpl({ ...opts, force: false })
       if ("__status" in result) {
         if (result.__status === 429) {
           // Floor at the backoff, but cap at staleMaxMs: the cooldown suppresses
@@ -512,10 +962,11 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
       claudeLog("oauth_usage.fetch_failed", { profile: cacheKey, error: err instanceof Error ? err.message : String(err) })
       return staleOr("exception", "upstream_error")
     } finally {
-      inflightByProfile.delete(cacheKey)
+      if (inflightByProfile.get(cacheKey) === promise) inflightByProfile.delete(cacheKey)
     }
-  })()
+  }
 
+  const promise = fetchAndCacheUsage()
   inflightByProfile.set(cacheKey, promise)
   return promise
 }
@@ -533,10 +984,25 @@ export function peekOAuthUsage(profileId?: string | null): OAuthUsageSnapshot | 
   return cacheByProfile.get(profileId ?? DEFAULT_KEY)
 }
 
+/** Clear cached OAuth usage snapshot, failure state, and 429 cooldowns for one profile. */
+export function clearOAuthUsageForProfile(profileId?: string | null): void {
+  const key = profileId ?? DEFAULT_KEY
+  cacheByProfile.delete(key)
+  inflightByProfile.delete(key)
+  rateLimitedUntilByProfile.delete(key)
+  failureByProfile.delete(key)
+  rateLimitRunByProfile.delete(key)
+  lastRateLimitRefreshAtByProfile.delete(key)
+}
+
 /** Test-only / shutdown helper — clears all cached snapshots and pending fetches. */
 export function resetOAuthUsageCache(): void {
   cacheByProfile.clear()
   inflightByProfile.clear()
   rateLimitedUntilByProfile.clear()
   failureByProfile.clear()
+  rateLimitRunByProfile.clear()
+  lastRateLimitRefreshAtByProfile.clear()
+  resetInflightByScope.clear()
+  resetLedger.clear()
 }

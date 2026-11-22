@@ -1,9 +1,41 @@
-import { describe, expect, it } from "bun:test"
+import { installModelsMock, syntheticClaudeBoundary } from "./modelsMock"
+installModelsMock(() => syntheticClaudeBoundary)
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { createServer } from "node:http"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { DEFAULT_PROXY_CONFIG, type ProxyInstance } from "../proxy/types"
 
 const { createProxyServer, startProxyServer } = await import("../proxy/server")
 const { runCli } = await import("../../bin/cli")
+const { enableDiskProfileDiscovery, invalidateDiskProfileCache, resetDiskProfileDiscovery } = await import("../proxy/profiles")
+const { setCredentialStorePlatformForTests } = await import("../proxy/tokenRefresh")
+const models = await import("../proxy/models")
+
+const stubStart = (onStart: () => void) => async (): Promise<ProxyInstance> => {
+  onStart()
+  return { server: createServer(), config: DEFAULT_PROXY_CONFIG, close: async () => {} }
+}
 
 describe("proxy async ops", () => {
+  const originalConfigDir = process.env.MERIDIAN_CONFIG_DIR
+  let configDir: string
+
+  beforeEach(() => {
+    configDir = mkdtempSync(join(tmpdir(), "meridian-async-ops-"))
+    process.env.MERIDIAN_CONFIG_DIR = configDir
+    invalidateDiskProfileCache()
+  })
+
+  afterEach(() => {
+    if (originalConfigDir === undefined) delete process.env.MERIDIAN_CONFIG_DIR
+    else process.env.MERIDIAN_CONFIG_DIR = originalConfigDir
+    resetDiskProfileDiscovery()
+    invalidateDiskProfileCache()
+    rmSync(configDir, { recursive: true, force: true })
+  })
+
   it("starts server with async executable resolution", async () => {
     const proxyA = await startProxyServer({ port: 0, host: "127.0.0.1" })
     const proxyB = await startProxyServer({ port: 0, host: "127.0.0.1" })
@@ -27,10 +59,10 @@ describe("proxy async ops", () => {
     expect(typeof body.status).toBe("string")
     expect(body.backend).toBe("claude")
     expect(typeof body.version).toBe("string")
-    expect(typeof body.mode).toBe("string")
     expect(["healthy", "degraded", "unhealthy"]).toContain(body.status)
 
     if (body.status === "healthy") {
+      expect(typeof body.mode).toBe("string")
       expect(typeof body.auth.loggedIn).toBe("boolean")
       expect(body.auth.loggedIn).toBe(true)
       // claudeExecutable is present when the resolver has run (lazy init —
@@ -40,7 +72,7 @@ describe("proxy async ops", () => {
       // got picked"). Accept either shape so this test is independent of
       // whether a sibling test already triggered resolution in the same
       // process.
-      const expectedKeys = ["auth", "backend", "build", "mode", "plugin", "status", "version"]
+      const expectedKeys = ["auth", "backend", "build", "mode", "plugin", "status", "upstream", "version"]
       if (body.claudeExecutable !== undefined) {
         expect(typeof body.claudeExecutable.path).toBe("string")
         expect([
@@ -58,12 +90,13 @@ describe("proxy async ops", () => {
     if (body.status === "unhealthy") {
       expect(typeof body.error).toBe("string")
       expect(body.auth.loggedIn).toBe(false)
-      expect(Object.keys(body).sort()).toEqual(["auth", "backend", "build", "error", "status", "version"])
+      expect(Object.keys(body).sort()).toEqual(["auth", "backend", "build", "error", "status", "upstream", "version"])
     }
 
     if (body.status === "degraded") {
+      expect(typeof body.mode).toBe("string")
       expect(typeof body.error).toBe("string")
-      expect(Object.keys(body).sort()).toEqual(["backend", "build", "error", "mode", "status", "version"])
+      expect(Object.keys(body).sort()).toEqual(["backend", "build", "error", "mode", "status", "upstream", "version"])
     }
 
     expect(response.status).toBe(body.status === "unhealthy" ? 503 : 200)
@@ -102,5 +135,80 @@ describe("proxy async ops", () => {
 
     expect(startCalled).toBe(1)
     expect(errors.some((line) => line.includes("Could not verify Claude auth status"))).toBe(true)
+  })
+
+  it("skips the CLI pre-flight auth check when profiles are configured", async () => {
+    writeFileSync(join(configDir, "profiles.json"), JSON.stringify([{ id: "p", claudeConfigDir: join(configDir, "p") }]))
+
+    let startCalled = 0
+    let authChecks = 0
+    await runCli(
+      stubStart(() => { startCalled += 1 }),
+      async () => {
+        authChecks += 1
+        return { stdout: JSON.stringify({ loggedIn: true, subscriptionType: "max" }) }
+      },
+    )
+
+    expect(startCalled).toBe(1)
+    expect(authChecks).toBe(0)
+  })
+
+  it("runs the CLI pre-flight auth check when a profile uses the default context", async () => {
+    writeFileSync(join(configDir, "profiles.json"), JSON.stringify([{ id: "p", claudeConfigDir: join(configDir, "p") }, { id: "bare" }]))
+
+    let startCalled = 0
+    let authChecks = 0
+    await runCli(
+      stubStart(() => { startCalled += 1 }),
+      async () => {
+        authChecks += 1
+        return { stdout: JSON.stringify({ loggedIn: true, subscriptionType: "max" }) }
+      },
+    )
+
+    expect(startCalled).toBe(1)
+    expect(authChecks).toBe(1)
+  })
+
+  it("keeps each profile's auth status warm, and the default context's only once no profile is left", async () => {
+    const profileDir = join(configDir, "p")
+    writeFileSync(join(configDir, "profiles.json"), JSON.stringify([{ id: "p", claudeConfigDir: profileDir }]))
+    enableDiskProfileDiscovery()
+    // File-backed stores, so the profile token refresh armed beside the
+    // keepalive never reaches the macOS Keychain when its tick runs below.
+    setCredentialStorePlatformForTests("linux")
+
+    const authCalls: Array<[string | undefined, Record<string, string> | undefined]> = []
+    const authSpy = spyOn(models, "getClaudeAuthStatusAsync").mockImplementation(async (profileId, envOverrides) => {
+      authCalls.push([profileId, envOverrides])
+      return null
+    })
+    const ticks: Array<() => void> = []
+    const realSetInterval = globalThis.setInterval
+    const intervalSpy = spyOn(globalThis, "setInterval").mockImplementation(((handler: () => void, ms?: number) => {
+      if (ms === 45_000) ticks.push(handler)
+      return realSetInterval(handler, ms)
+    }) as typeof setInterval)
+
+    let proxy: ProxyInstance | undefined
+    try {
+      proxy = await startProxyServer({ port: 0, host: "127.0.0.1" })
+      intervalSpy.mockRestore()
+      const tick = () => { authCalls.length = 0; for (const run of ticks) run() }
+
+      tick()
+      expect(authCalls).toEqual([["p", { CLAUDE_CONFIG_DIR: profileDir }]])
+
+      writeFileSync(join(configDir, "profiles.json"), "[]")
+      invalidateDiskProfileCache()
+      tick()
+      expect(authCalls).toEqual([[undefined, undefined]])
+    } finally {
+      intervalSpy.mockRestore()
+      authSpy.mockRestore()
+      setCredentialStorePlatformForTests(null)
+      await proxy?.close()
+    }
   })
 })

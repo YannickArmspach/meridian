@@ -23,8 +23,10 @@
  * combination an immediate abort could not give — it skipped the commit.
  *
  * This module still drains rather than aborts, because the cap is lifted for
- * deferred tools, advisors, structured output, and the kill switch. In those
- * configurations the digest turn does generate and is discarded here.
+ * deferred tools, advisors, structured output, and the kill switch. With
+ * deferred tools or an advisor, a PostToolBatch hook ends the query after the
+ * forwarded batch (see stopAfterForwardedBatch), so no digest turn runs. With
+ * structured output or the kill switch it does generate and is discarded here.
  *
  * Settlement is necessary but NOT sufficient to freeze the checkpoint. Two
  * further conditions belong to the caller, which owns the wire:
@@ -48,7 +50,8 @@
 const CLIENT_TOOL_PREFIX = "mcp__oc__"
 
 /** Internal SDK tools execute inside the SDK. Their results never require
- *  a client tool_result and must not arm a passthrough checkpoint. */
+ *  a client tool_result and must not arm a passthrough checkpoint.
+ *  ToolSearch is a client tool in client-search mode. */
 const INTERNAL_TOOLS = new Set(["ToolSearch", "StructuredOutput"])
 
 export interface EarlyStopTracker {
@@ -81,15 +84,45 @@ export interface ClientForwardedToolUse {
   name: string
 }
 
+/**
+ * Is this tool name the SDK's own search tool, which the SDK runs and the
+ * client never sees?
+ *
+ * The bare `ToolSearch` is the SDK's unless the client owns the search. The
+ * name under the client prefix (`mcp__oc__ToolSearch`) is the SDK's only when
+ * `sdkOwnsPrefixedSearch`: the request defers tools, so the SDK has a real
+ * ToolSearch, and the client declares none of its own. The deferred-tools
+ * note lists every deferred tool by its `mcp__oc__*` name, and a live model
+ * once called the search under that prefix too. The CLI refuses that name;
+ * taking the prefix for a client tool forwarded it as `ToolSearch` to a client
+ * that never declared one, which then failed it and paid a whole extra round.
+ * Kept inside the SDK, the refusal lets the model retry with the real tool
+ * within the same turn budget. Without deferred tools there is no SDK search
+ * to retry with, so the name stays an ordinary unknown tool.
+ */
+export function isSdkToolSearchCall(
+  name: string,
+  clientToolPrefix: string = CLIENT_TOOL_PREFIX,
+  clientOwnsToolSearch = false,
+  sdkOwnsPrefixedSearch = false,
+): boolean {
+  if (name === "ToolSearch") return !clientOwnsToolSearch
+  return sdkOwnsPrefixedSearch && name === `${clientToolPrefix}ToolSearch`
+}
+
 export function isClientForwardedToolUse(
   block: unknown,
   clientToolPrefix: string = CLIENT_TOOL_PREFIX,
+  clientOwnsToolSearch = false,
+  /** See isSdkToolSearchCall. */
+  sdkOwnsPrefixedSearch = false,
 ): block is ClientForwardedToolUse {
   const b = block as { type?: unknown; id?: unknown; name?: unknown } | null | undefined
   if (!b || b.type !== "tool_use") return false
   if (typeof b.id !== "string" || b.id.length === 0) return false
   if (typeof b.name !== "string") return false
-  if (INTERNAL_TOOLS.has(b.name)) return false
+  if (INTERNAL_TOOLS.has(b.name) && !(clientOwnsToolSearch && b.name === "ToolSearch")) return false
+  if (sdkOwnsPrefixedSearch && b.name === `${clientToolPrefix}ToolSearch`) return false
   if (b.name.startsWith("mcp__") && !b.name.startsWith(clientToolPrefix)) return false
   return true
 }
@@ -101,10 +134,12 @@ export function noteAssistantContent(
   tracker: EarlyStopTracker,
   content: unknown,
   clientToolPrefix: string = CLIENT_TOOL_PREFIX,
+  clientOwnsToolSearch = false,
+  sdkOwnsPrefixedSearch = false,
 ): void {
   if (!Array.isArray(content)) return
   for (const block of content) {
-    if (isClientForwardedToolUse(block, clientToolPrefix)) {
+    if (isClientForwardedToolUse(block, clientToolPrefix, clientOwnsToolSearch, sdkOwnsPrefixedSearch)) {
       tracker.expected.add(block.id)
     }
   }
@@ -123,6 +158,8 @@ export function noteAssistantMessage(
   tracker: EarlyStopTracker,
   message: unknown,
   clientToolPrefix: string = CLIENT_TOOL_PREFIX,
+  clientOwnsToolSearch = false,
+  sdkOwnsPrefixedSearch = false,
 ): void {
   const m = message as { type?: unknown; uuid?: unknown; message?: { content?: unknown } } | null | undefined
   if (m?.type !== "assistant") return
@@ -135,7 +172,7 @@ export function noteAssistantMessage(
   // resumed (#996). `isClientForwardedToolUse` is deliberately strict about
   // foreign `mcp__*` names, which is what makes a missed prefix silent rather
   // than noisy.
-  noteAssistantContent(tracker, content, clientToolPrefix)
+  noteAssistantContent(tracker, content, clientToolPrefix, clientOwnsToolSearch, sdkOwnsPrefixedSearch)
   if (tracker.expected.size > before) {
     // A newer tool-bearing assistant message supersedes the older checkpoint.
     // Fail closed when its UUID is absent: the older message may not contain
@@ -184,12 +221,16 @@ export function allForwardedCallsResolved(tracker: EarlyStopTracker): boolean {
  */
 export interface CompleteToolResultContinuationOptions {
   /**
-   * NOTE: agent-specific (claude-code) — with its `mid-conversation-system`
-   * feature on (beta `mid-conversation-system-2026-04-07`; seen on 2.1.259
-   * and 2.1.261), claude-cli ends a tool-result delta with one trailing
-   * `system` reminder turn. The Messages contract has no system role, so the
-   * turn is admitted only here, only as the final message, only behind a
-   * single echo of the complete expected ID set, and is delivered as
+   * NOTE: agent-specific (claude-code, pi, opencode) — with its
+   * `mid-conversation-system` feature on (beta
+   * `mid-conversation-system-2026-04-07`; seen on 2.1.259 and 2.1.261),
+   * claude-cli ends a tool-result delta with one trailing `system` reminder
+   * turn; Oh My Pi upgrades developer-origin notes to the same turn, and
+   * OpenCode 2 (seen on 2.0.21) sends instruction updates (a changed
+   * AGENTS.md, a date rollover, an MCP or skill catalog change) the same way
+   * on models with native system updates. The Messages contract has no system
+   * role, so the turn is admitted only here, only as the final message, only
+   * behind a single echo of the complete expected ID set, and is delivered as
    * unprivileged user text after the results — never as an SDK system prompt.
    */
   allowTrailingSystemReminder?: boolean
@@ -239,6 +280,8 @@ export function coalesceCompleteToolResultContinuation(
   let sawTrailingSystem = false
   const systemTextBlocks: unknown[] = []
   let echoMessages = 0
+  // Set by a mid-batch echo: the next user message continues the same batch.
+  let continuesBatch = false
 
   for (const message of messages) {
     if (isMidConvoEffortSystemMessage(message)) {
@@ -285,10 +328,30 @@ export function coalesceCompleteToolResultContinuation(
       echoMessages++
       continue
     }
+    // NOTE: a Responses-API client that records each tool output right after
+    // its own call (Meowbert did) reaches us as one assistant/user pair per
+    // call: [assistant A, user A, assistant B, user B]. Every later pair still
+    // belongs to the checkpoint batch, so accept it while the batch is unsettled,
+    // only results have been seen, and the echo names only unseen batch calls.
+    if (message.role === "assistant") {
+      if (echoMessages === 0 || sawNonToolResult || actual.size === expected.size) return undefined
+      if (!Array.isArray(message.content) || message.content.length === 0) return undefined
+      for (const rawBlock of message.content) {
+        const block = rawBlock as { type?: unknown; id?: unknown } | null | undefined
+        if (block?.type !== "tool_use") return undefined
+        if (typeof block.id !== "string" || !expected.has(block.id) || echoedCalls.has(block.id)) return undefined
+        echoedCalls.add(block.id)
+      }
+      echoMessages++
+      continuesBatch = true
+      continue
+    }
     if (message.role !== "user") return undefined
     // A queued user turn may follow only after the first turn settled the full
-    // checkpoint batch. Splitting results across turns is not a valid resume.
-    if (sawUser && actual.size !== expected.size) return undefined
+    // checkpoint batch. Splitting results across turns is not a valid resume,
+    // except across the per-call echoes accepted above.
+    if (sawUser && actual.size !== expected.size && !continuesBatch) return undefined
+    continuesBatch = false
     const userContent = Array.isArray(message.content)
       ? message.content
       : typeof message.content === "string"
@@ -301,6 +364,8 @@ export function coalesceCompleteToolResultContinuation(
       if (block?.type === "tool_result") {
         if (sawNonToolResult || typeof block.tool_use_id !== "string") return undefined
         if (!expected.has(block.tool_use_id) || actual.has(block.tool_use_id)) return undefined
+        // Once the client echoes calls, each result must follow its own echo.
+        if (echoedCalls.size > 0 && !echoedCalls.has(block.tool_use_id)) return undefined
         actual.add(block.tool_use_id)
       } else {
         sawNonToolResult = true
@@ -319,6 +384,54 @@ export function coalesceCompleteToolResultContinuation(
   // Reminder last, as on the wire.
   if (systemTextBlocks.length > 0) content.push(...systemTextBlocks)
   return [{ role: "user", content }]
+}
+
+/**
+ * The delta settles the checkpoint batch in its first user message, but the
+ * history then moved on past it: an assistant turn follows. A stream cut off
+ * by a dropped connection leaves exactly this shape — complete tool results,
+ * a partial assistant message, then the next user turn. The checkpoint is not
+ * contradicted, only passed, so the caller can resume the stored session
+ * instead of replaying the whole conversation.
+ */
+export function settlesCheckpointThenContinues(
+  messages: Array<{ role?: unknown; content?: unknown }>,
+  expectedIds: readonly string[],
+  options?: CompleteToolResultContinuationOptions,
+): boolean {
+  const firstUser = messages.findIndex((message) => message.role === "user")
+  if (firstUser < 0) return false
+  if (coalesceCompleteToolResultContinuation(messages.slice(0, firstUser + 1), expectedIds, options) === undefined) return false
+
+  // This rescue covers only the observed interrupted-text shape. Looking for
+  // any later assistant turn would skip validation of later tool results,
+  // tool calls or system reminders and resume a genuinely changed history.
+  const interrupted = messages[firstUser + 1]
+  if (interrupted?.role !== "assistant") return false
+  const assistantContent = typeof interrupted.content === "string"
+    ? [{ type: "text", text: interrupted.content }]
+    : interrupted.content
+  if (!Array.isArray(assistantContent) || assistantContent.length === 0 ||
+      !assistantContent.every((rawBlock) => {
+        const block = rawBlock as { type?: unknown; text?: unknown } | null | undefined
+        return block?.type === "text" && typeof block.text === "string" && block.text.trim().length > 0
+      })) return false
+
+  const subsequent = messages.slice(firstUser + 2)
+  if (subsequent.length === 0) return false
+  for (const message of subsequent) {
+    if (message.role !== "user") return false
+    if (typeof message.content === "string") {
+      if (message.content.trim().length === 0) return false
+      continue
+    }
+    if (!Array.isArray(message.content) || message.content.length === 0) return false
+    for (const rawBlock of message.content) {
+      const block = rawBlock as { type?: unknown } | null | undefined
+      if (!block || typeof block !== "object" || block.type === "tool_result" || block.type === "tool_use") return false
+    }
+  }
+  return true
 }
 
 /** Find and validate the exact echoed assistant checkpoint plus its result tail. */
@@ -400,8 +513,10 @@ export type ClientAbortDisposition =
  * A client abort leaves the SDK session ending in an interrupted tail. Even an
  * assistant UUID already seen in the iterator is not known durable until the
  * canonical result: the live PTY regression yielded that UUID but never wrote
- * it durably after abort. Therefore every owned mapping is evicted; a replay
- * costs one cache miss but cannot wedge on a missing or interrupted boundary.
+ * it durably after abort. Therefore every owned mapping the turn may have
+ * advanced is evicted, or kept behind the interrupted-turn check
+ * (`interruptedMappingAction` in session/interruptedTurn.ts); a replay costs
+ * one cache miss but cannot wedge on a missing or interrupted boundary.
  */
 export function clientAbortDisposition(input: {
   isIndependentSession: boolean

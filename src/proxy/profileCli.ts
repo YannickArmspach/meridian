@@ -11,7 +11,7 @@
 
 import { execFileSync, spawnSync } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
-import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { configPath } from "../configDir"
@@ -20,7 +20,9 @@ import { authFieldPaths, describeAuthFields } from "./authDiscovery"
 import { resolveClaudeExecutableSync } from "./models"
 import { fetchOAuthPlanFields, type OAuthPlanFields } from "./oauthPlan"
 import type { ProfileConfig } from "./profiles"
+import { applyProfileRemove } from "./profileRemove"
 import { envBool } from "../env"
+import { findChatGptSeat, listChatGptSeats, printChatGptSeats, removeChatGptSeat, renameChatGptSeat, signInChatGptSeat, switchChatGptSeat, type SeatCliContext } from "./chatgpt/seatCli"
 
 import {
   applyProfileRename,
@@ -31,12 +33,25 @@ import {
   saveProfileConfigTo,
 } from "./profileRename"
 import { getSetting, setSetting } from "../settings"
+import { publishProfileConfig, readProfileConfigForUpdate, withProfileConfigLock, withProfileConfigLockSync } from "./profileConfigStore"
 import { createPlatformCredentialStore, type CredentialsFile } from "./tokenRefresh"
 
 const OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
 export const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 export const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 export const OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+
+/**
+ * Path Anthropic has registered for this client's loopback redirect.
+ *
+ * `https://claude.ai/oauth/claude-code-client-metadata` declares
+ * `redirect_uris: ["http://localhost/callback", "http://127.0.0.1/callback"]`
+ * — the RFC 8252 §7.3 loopback convention, where the port is not part of the
+ * match but the host and path are. So a redirect back into Meridian has to be
+ * served from `/callback` at the root, on `localhost` or `127.0.0.1`; no other
+ * path will be accepted, which is why the route is not under `/profiles/`.
+ */
+export const OAUTH_LOOPBACK_CALLBACK_PATH = "/callback"
 const OAUTH_SCOPES = [
   "org:create_api_key",
   "user:profile",
@@ -52,10 +67,6 @@ function profilesConfigFile(): string {
 
 function ensureProfilesDir(): void {
   mkdirSync(configPath("profiles"), { recursive: true })
-}
-
-function getProfileDir(id: string): string {
-  return configPath("profiles", id)
 }
 
 /**
@@ -74,8 +85,24 @@ function yellow(text: string): string {
   return process.stdout.isTTY ? `\x1b[33m${text}\x1b[0m` : text
 }
 
+/**
+ * Config directory a browser-login profile gets when it carries no explicit
+ * `claudeConfigDir`. Exported so the web login route resolves the same
+ * directory this CLI would, instead of rebuilding the path a third time
+ * (profiles.ts already builds it for oauth-token isolation).
+ */
+export function profileConfigDirFor(id: string): string {
+  return configPath("profiles", id)
+}
+
+function getProfileDir(id: string): string {
+  return profileConfigDirFor(id)
+}
+
 interface AuthLoginOptions {
   headless?: boolean
+  /** Add or sign in a ChatGPT seat by this name rather than a Claude profile. */
+  chatgpt?: boolean
 }
 
 interface ManualOAuthSession {
@@ -94,6 +121,8 @@ interface OAuthTokenResponse {
   refresh_token?: string
   expires_in?: number
   expires_at?: number
+  refresh_token_expires_in?: number
+  refresh_token_expires_at?: number
   scope?: string
 }
 
@@ -111,21 +140,66 @@ function base64Url(bytes: Buffer): string {
   return bytes.toString("base64url")
 }
 
-export function createManualOAuthSession(scopes?: string[]): ManualOAuthSession {
-  const scopeList = scopes ?? OAUTH_SCOPES
+export interface OAuthPkce {
+  codeVerifier: string
+  codeChallenge: string
+  state: string
+}
+
+export function createOAuthPkce(): OAuthPkce {
   const codeVerifier = base64Url(randomBytes(32))
-  const state = base64Url(randomBytes(32))
-  const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url")
+  return {
+    codeVerifier,
+    codeChallenge: createHash("sha256").update(codeVerifier).digest("base64url"),
+    state: base64Url(randomBytes(32)),
+  }
+}
+
+/**
+ * Build an authorize URL for one PKCE challenge and one redirect_uri.
+ *
+ * Separate from `createOAuthPkce` because a single login needs TWO of these:
+ * one redirecting to a loopback listener, one to Anthropic's code-display
+ * page. Claude Code builds the same pair from one challenge
+ * (`buildAuthUrl({...opts, isManual: true})` and `isManual: false`), opens the
+ * loopback one and prints the manual one, then picks the matching redirect_uri
+ * again at exchange time. Whichever the user completes, the other is simply
+ * never used — so the paste fallback costs nothing and needs no second login.
+ *
+ * `code=true` is set for both. It is NOT what makes Anthropic display the code
+ * rather than redirect: Claude Code appends it unconditionally in both modes,
+ * and the redirect_uri alone decides.
+ */
+export function buildAuthorizeUrl(params: {
+  codeChallenge: string
+  state: string
+  redirectUri: string
+  scopes?: string[]
+}): string {
   const url = new URL(OAUTH_AUTHORIZE_URL)
   url.searchParams.set("code", "true")
   url.searchParams.set("client_id", OAUTH_CLIENT_ID)
   url.searchParams.set("response_type", "code")
-  url.searchParams.set("redirect_uri", OAUTH_REDIRECT_URI)
-  url.searchParams.set("scope", scopeList.join(" "))
-  url.searchParams.set("code_challenge", codeChallenge)
+  url.searchParams.set("redirect_uri", params.redirectUri)
+  url.searchParams.set("scope", (params.scopes ?? OAUTH_SCOPES).join(" "))
+  url.searchParams.set("code_challenge", params.codeChallenge)
   url.searchParams.set("code_challenge_method", "S256")
-  url.searchParams.set("state", state)
-  return { authorizeUrl: url.toString(), codeVerifier, state }
+  url.searchParams.set("state", params.state)
+  return url.toString()
+}
+
+export function createManualOAuthSession(scopes?: string[]): ManualOAuthSession {
+  const pkce = createOAuthPkce()
+  return {
+    authorizeUrl: buildAuthorizeUrl({
+      codeChallenge: pkce.codeChallenge,
+      state: pkce.state,
+      redirectUri: OAUTH_REDIRECT_URI,
+      scopes,
+    }),
+    codeVerifier: pkce.codeVerifier,
+    state: pkce.state,
+  }
 }
 
 export function parseAuthorizationCodeInput(input: string): ParsedAuthorizationCode | null {
@@ -158,18 +232,28 @@ function loadProfileConfig(): ProfileConfig[] {
   }
 }
 
-function saveProfileConfig(profiles: ProfileConfig[]): void {
-  ensureProfilesDir()
-  writeFileSync(profilesConfigFile(), `${JSON.stringify(profiles, null, 2)}\n`, { mode: 0o600 })
+/**
+ * Ids currently written to profiles.json, for collision checks.
+ *
+ * Ids only. The file also holds `apiKey` and `oauthToken` values, and a
+ * collision check has no business handling those — the narrower return type is
+ * what keeps them from reaching a caller that might render or log one.
+ */
+export function loadProfileIds(): string[] {
+  return loadProfileConfig().map(p => p.id)
 }
 
-function getAuthStatus(configDir: string): { loggedIn: boolean; email?: string; subscriptionType?: string } {
+function saveProfileConfig(profiles: ProfileConfig[]): void {
+  ensureProfilesDir()
+  publishProfileConfig(profilesConfigFile(), profiles)
+}
+
+function getAuthStatus(configDir: string, resolved = resolveClaudeExecutableSync()): { loggedIn: boolean; email?: string; subscriptionType?: string } {
   // Route through the synchronous resolver instead of relying on `claude`
   // being on PATH (#478). The CLI command runs in whatever environment
   // the user invokes it — under systemd or bunx-without-global-claude,
   // PATH won't have a claude binary even when meridian's own bundled or
   // platform-package binary is right there in node_modules.
-  const resolved = resolveClaudeExecutableSync()
   if (!resolved) {
     console.warn(`[meridian] Could not resolve a Claude executable for auth check (set MERIDIAN_CLAUDE_PATH or install @anthropic-ai/claude-code)`)
     return { loggedIn: false }
@@ -179,6 +263,7 @@ function getAuthStatus(configDir: string): { loggedIn: boolean; email?: string; 
     // resolved path and bypasses the shell entirely — no PATH lookup.
     const result = execFileSync(resolved.path, ["auth", "status"], {
       timeout: 5000,
+      windowsHide: true,
       env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
       stdio: ["pipe", "pipe", "pipe"],
     })
@@ -220,15 +305,137 @@ export function buildLoginCredentials(
   plan: OAuthPlanFields,
   now: number = Date.now(),
 ): CredentialsFile {
+  // Preserve the provider's refresh deadline just as the refresh path does.
+  // Missing/malformed metadata is unknown; do not guess its units or lifetime.
+  const refreshDeadline = tokenData.refresh_token_expires_at ??
+    (typeof tokenData.refresh_token_expires_in === "number" && tokenData.refresh_token_expires_in > 0
+      ? now + tokenData.refresh_token_expires_in * 1000 : undefined)
+  const refreshTokenExpiresAt = typeof refreshDeadline === "number"
+    && Number.isFinite(refreshDeadline) && refreshDeadline > now && refreshDeadline <= 8.64e15
+    ? refreshDeadline : undefined
+  // A null seat only clears a stored one; a new credential has none to clear.
+  const { seatTier, ...knownPlan } = plan
   return {
     claudeAiOauth: {
       accessToken: tokenData.access_token,
       refreshToken: tokenData.refresh_token,
       expiresAt: tokenData.expires_at ?? now + (tokenData.expires_in ?? 8 * 60 * 60) * 1000,
+      ...(refreshTokenExpiresAt ? { refreshTokenExpiresAt } : {}),
       scopes: tokenData.scope?.split(" ").filter(Boolean) ?? OAUTH_SCOPES,
-      ...plan,
+      ...knownPlan,
+      ...(seatTier ? { seatTier } : {}),
     },
   }
+}
+
+export type OAuthExchangeFailureReason =
+  | "state_mismatch"
+  | "request_failed"
+  | "http_error"
+  | "invalid_response"
+  | "missing_tokens"
+  | "write_failed"
+
+export type OAuthExchangeResult =
+  | { ok: true }
+  | { ok: false; reason: OAuthExchangeFailureReason; status?: number; detail?: string }
+
+export interface OAuthExchangeParams {
+  /** Authorization code parsed out of the user's paste. */
+  code: string
+  /** `state` the paste carried, when it carried one (a pasted URL does). */
+  returnedState?: string
+  /** `state` this login was started with — what `returnedState` must match. */
+  sessionState: string
+  /** PKCE verifier for this login. */
+  codeVerifier: string
+  /** CLAUDE_CONFIG_DIR whose credential store receives the tokens. */
+  claudeConfigDir: string
+  /**
+   * redirect_uri to send with the grant. MUST be the one the authorize step
+   * used — the code is bound to it, and a mismatch is rejected. Defaults to
+   * the code-display page, which is what a pasted code always comes from.
+   */
+  redirectUri?: string
+  /** Scopes recorded when the token response omits `scope`. */
+  scopes?: string[]
+  /** Injectable for tests — defaults to global `fetch`. */
+  fetchFn?: typeof fetch
+}
+
+/**
+ * Validate `state`, exchange an authorization code for OAuth credentials, and
+ * write them to a profile's credential store.
+ *
+ * ONE implementation, two front ends: `meridian profile login --headless`
+ * (which prompts for the paste) and `POST /profiles/login/complete` (which
+ * receives it over HTTP). Both parse the paste with
+ * `parseAuthorizationCodeInput` and hand the result here, so state validation,
+ * the token request and what gets persisted cannot drift between them.
+ *
+ * Returns a reason instead of throwing or printing, because the two callers
+ * present failure differently: the CLI renders reasons as red lines, the HTTP
+ * route maps them to status codes. `detail` carries the token endpoint's error
+ * body (truncated) for the CLI's diagnostics; the route drops it rather than
+ * rendering an upstream error body into a page.
+ */
+export async function exchangeAuthorizationCodeForCredentials(params: OAuthExchangeParams): Promise<OAuthExchangeResult> {
+  if (params.returnedState && params.returnedState !== params.sessionState) {
+    return { ok: false, reason: "state_mismatch" }
+  }
+
+  const fetchFn = params.fetchFn ?? fetch
+  let response: Response
+  try {
+    response = await fetchFn(OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "authorization_code",
+        client_id: OAUTH_CLIENT_ID,
+        code: params.code,
+        redirect_uri: params.redirectUri ?? OAUTH_REDIRECT_URI,
+        code_verifier: params.codeVerifier,
+        state: params.returnedState ?? params.sessionState,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    })
+  } catch (err) {
+    return { ok: false, reason: "request_failed", detail: err instanceof Error ? err.message : String(err) }
+  }
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "")
+    return { ok: false, reason: "http_error", status: response.status, detail: body.slice(0, 300) || undefined }
+  }
+
+  let tokenData: OAuthTokenResponse
+  try {
+    tokenData = await response.json() as OAuthTokenResponse
+  } catch (err) {
+    return { ok: false, reason: "invalid_response", detail: err instanceof Error ? err.message : String(err) }
+  }
+
+  claudeLog("auth.token_discovered", {
+    fields: authFieldPaths(tokenData),
+    payload: describeAuthFields(tokenData),
+  })
+  if (!hasRequiredTokens(tokenData)) {
+    return { ok: false, reason: "missing_tokens" }
+  }
+
+  const plan = await fetchOAuthPlanFields(tokenData.access_token, fetchFn)
+  const store = createPlatformCredentialStore({ claudeConfigDir: params.claudeConfigDir })
+  const credentials = buildLoginCredentials({
+    ...tokenData,
+    scope: tokenData.scope ?? params.scopes?.join(" "),
+  }, plan)
+  claudeLog("auth.credentials_built", {
+    fields: authFieldPaths(credentials.claudeAiOauth),
+    payload: describeAuthFields(credentials.claudeAiOauth),
+  })
+  const written = await store.write(credentials)
+  return written ? { ok: true } : { ok: false, reason: "write_failed" }
 }
 
 async function completeManualOAuthLogin(configDir: string): Promise<boolean> {
@@ -238,94 +445,134 @@ async function completeManualOAuthLogin(configDir: string): Promise<boolean> {
   console.log(session.authorizeUrl)
   console.log()
   console.log("After sign-in, paste the code shown by Claude below.")
+  console.log("\x1b[90m(the whole callback URL works too)\x1b[0m")
   const input = promptLine("Paste code:")
   const parsed = parseAuthorizationCodeInput(input)
   if (!parsed) {
     console.error("\x1b[31m✗ No authorization code received.\x1b[0m")
     return false
   }
-  if (parsed.state && parsed.state !== session.state) {
-    console.error("\x1b[31m✗ OAuth state mismatch. Please retry the login.\x1b[0m")
-    return false
-  }
 
-  let response: Response
-  try {
-    response = await fetch(OAUTH_TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "authorization_code",
-        client_id: OAUTH_CLIENT_ID,
-        code: parsed.code,
-        redirect_uri: OAUTH_REDIRECT_URI,
-        code_verifier: session.codeVerifier,
-        state: parsed.state ?? session.state,
-      }),
-      signal: AbortSignal.timeout(30_000),
-    })
-  } catch (err) {
-    claudeLog("auth.token_request_failed", { error: String(err) })
-    console.error(`\x1b[31m✗ OAuth token exchange failed: ${err instanceof Error ? err.message : err}\x1b[0m`)
-    return false
-  }
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => "")
-    claudeLog("auth.token_bad_response", { status: response.status, bodyLength: body.length })
-    console.error(`\x1b[31m✗ OAuth token exchange failed (${response.status}).\x1b[0m`)
-    if (body) console.error(`  ${body.slice(0, 300)}`)
-    return false
-  }
-
-  let tokenData: OAuthTokenResponse
-  try {
-    tokenData = await response.json() as OAuthTokenResponse
-  } catch (err) {
-    claudeLog("auth.token_parse_failed", { error: String(err) })
-    console.error(`\x1b[31m✗ OAuth token response was invalid: ${err instanceof Error ? err.message : err}\x1b[0m`)
-    return false
-  }
-
-  // Logged before the required-token check, so a response that is missing one
-  // of them still says what it did contain — that case is exactly when the
-  // field list is worth having.
-  claudeLog("auth.token_discovered", {
-    fields: authFieldPaths(tokenData),
-    payload: describeAuthFields(tokenData),
+  const result = await exchangeAuthorizationCodeForCredentials({
+    code: parsed.code,
+    returnedState: parsed.state,
+    sessionState: session.state,
+    codeVerifier: session.codeVerifier,
+    claudeConfigDir: configDir,
   })
+  if (result.ok) return true
 
-  if (!hasRequiredTokens(tokenData)) {
-    console.error("\x1b[31m✗ OAuth token response did not include the required tokens.\x1b[0m")
-    return false
+  switch (result.reason) {
+    case "state_mismatch":
+      console.error("\x1b[31m✗ OAuth state mismatch. Please retry the login.\x1b[0m")
+      break
+    case "request_failed":
+      console.error(`\x1b[31m✗ OAuth token exchange failed: ${result.detail}\x1b[0m`)
+      break
+    case "http_error":
+      console.error(`\x1b[31m✗ OAuth token exchange failed (${result.status}).\x1b[0m`)
+      if (result.detail) console.error(`  ${result.detail}`)
+      break
+    case "invalid_response":
+      console.error(`\x1b[31m✗ OAuth token response was invalid: ${result.detail}\x1b[0m`)
+      break
+    case "missing_tokens":
+      console.error("\x1b[31m✗ OAuth token response did not include the required tokens.\x1b[0m")
+      break
+    case "write_failed":
+      console.error("\x1b[31m✗ Could not write credentials for this profile.\x1b[0m")
+      break
+  }
+  return false
+}
+
+export type ProfileSlotFailureReason = "invalid_id" | "already_exists" | "write_failed"
+
+export type CreateProfileSlotResult =
+  | { ok: true; profile: ProfileConfig; profiles: ProfileConfig[] }
+  | { ok: false; reason: ProfileSlotFailureReason; message: string }
+
+/**
+ * Turn a valid, non-colliding id into the two things a browser-login profile
+ * is made of: an entry in profiles.json and a CLAUDE_CONFIG_DIR of its own.
+ *
+ * ONE implementation, two front ends — `meridian profile add` and
+ * `POST /profiles/add/complete` — for the same reason the token exchange has
+ * one: two copies of "what a profile is made of" drift, and the copy that
+ * drifts is the one nobody runs.
+ *
+ * The collision check reads profiles.json at call time rather than trusting a
+ * list the caller loaded earlier, so a slot created between an early check and
+ * this one is still caught.
+ *
+ * `claudeConfigDir` adopts a directory that already holds credentials — the
+ * CLI's `~/.claude` import. Omitted, the profile gets a fresh directory of its
+ * own under `profiles/<id>`.
+ */
+export function createProfileSlot(id: string, options: { claudeConfigDir?: string } = {}): CreateProfileSlotResult {
+  try { return withProfileConfigLockSync(profilesConfigFile(), () => createProfileSlotLocked(id, options)) }
+  catch (error) { return { ok: false, reason: "write_failed", message: error instanceof Error ? error.message : String(error) } }
+}
+
+/** HTTP callers await competing writers without blocking model/health traffic. */
+export async function createProfileSlotAsync(id: string, options: { claudeConfigDir?: string } = {}): Promise<CreateProfileSlotResult> {
+  try { return await withProfileConfigLock(profilesConfigFile(), () => createProfileSlotLocked(id, options)) }
+  catch (error) { return { ok: false, reason: "write_failed", message: error instanceof Error ? error.message : String(error) } }
+}
+
+function createProfileSlotLocked(id: string, options: { claudeConfigDir?: string }): CreateProfileSlotResult {
+  if (!isValidProfileId(id)) {
+    return {
+      ok: false,
+      reason: "invalid_id",
+      message: "Invalid profile ID. Use only letters, numbers, hyphens and underscores.",
+    }
   }
 
-  const plan = await fetchOAuthPlanFields(tokenData.access_token)
-  const store = createPlatformCredentialStore({ claudeConfigDir: configDir })
-  const credentials = buildLoginCredentials(tokenData, plan)
-  // What ends up on disk, which is not the same question as what arrived: the
-  // two lines together localize a lost field to the response or to this build.
-  claudeLog("auth.credentials_built", {
-    fields: authFieldPaths(credentials.claudeAiOauth),
-    payload: describeAuthFields(credentials.claudeAiOauth),
-  })
-  return store.write(credentials)
+  const profiles = readProfileConfigForUpdate(profilesConfigFile())
+  if (profiles.some(p => p.id === id)) {
+    return { ok: false, reason: "already_exists", message: `Profile "${id}" already exists.` }
+  }
+
+  const claudeConfigDir = options.claudeConfigDir ?? profileConfigDirFor(id)
+  const profile: ProfileConfig = { id, claudeConfigDir }
+  try {
+    mkdirSync(claudeConfigDir, { recursive: true })
+    profiles.push(profile)
+    saveProfileConfig(reclaimAlias(profiles, id))
+  } catch (err) {
+    return { ok: false, reason: "write_failed", message: err instanceof Error ? err.message : String(err) }
+  }
+
+  return { ok: true, profile, profiles }
+}
+
+/** CLI wrapper: `createProfileSlot` refusals are fatal for `meridian profile add`. */
+function createProfileSlotOrExit(id: string, options: { claudeConfigDir?: string } = {}): ProfileConfig[] {
+  const created = createProfileSlot(id, options)
+  if (!created.ok) {
+    console.error(`\x1b[31m✗ ${created.message}\x1b[0m`)
+    if (created.reason === "already_exists") console.error(`  Run: meridian profile list`)
+    process.exit(1)
+  }
+  return created.profiles
 }
 
 export async function profileAdd(id: string, options: AuthLoginOptions = {}): Promise<void> {
+  if (options.chatgpt || chatGptSeatNamed(id)) return chatGptSignInOrExit(id, options)
   if (!isValidProfileId(id)) {
     console.error("\x1b[31m✗ Invalid profile ID.\x1b[0m Use only letters, numbers, hyphens, underscores.")
     process.exit(1)
   }
 
-  let profiles = loadProfileConfig()
+  // Checked here as well as inside createProfileSlot: this one fails before a
+  // browser login the user would otherwise complete for nothing.
+  const profiles = loadProfileConfig()
   if (profiles.find(p => p.id === id)) {
     console.error(`\x1b[31m✗ Profile "${id}" already exists.\x1b[0m`)
     console.error(`  Run: meridian profile list`)
     process.exit(1)
   }
-  profiles = reclaimAlias(profiles, id)
-
   // Offer to import existing ~/.claude credentials if this is the first profile
   // and the default config dir has valid, active auth
   const defaultClaudeDir = join(homedir(), ".claude")
@@ -336,10 +583,9 @@ export async function profileAdd(id: string, options: AuthLoginOptions = {}): Pr
       console.log(`\x1b[32m✓ Found existing Claude credentials (${defaultAuth.email}, ${defaultAuth.subscriptionType || "unknown"})\x1b[0m`)
       const answer = promptYesNo(`  Import as profile "${id}"?`)
       if (answer) {
-        profiles.push({ id, claudeConfigDir: defaultClaudeDir })
-        saveProfileConfig(profiles)
+        const imported = createProfileSlotOrExit(id, { claudeConfigDir: defaultClaudeDir })
         console.log(`\x1b[32m✓ Profile "${id}" imported — using ${defaultAuth.email}\x1b[0m`)
-        printEnvHint(profiles)
+        printEnvHint(imported)
         return
       }
       console.log()
@@ -349,6 +595,9 @@ export async function profileAdd(id: string, options: AuthLoginOptions = {}): Pr
   }
 
   const configDir = getProfileDir(id)
+  // Created before the login rather than by createProfileSlot afterwards: the
+  // `claude auth login` subprocess writes its credentials into this directory,
+  // so it has to exist first. The profiles.json entry still waits for success.
   mkdirSync(configDir, { recursive: true })
 
   console.log(`\x1b[36mAdding profile: ${id}\x1b[0m`)
@@ -359,9 +608,7 @@ export async function profileAdd(id: string, options: AuthLoginOptions = {}): Pr
   const existingAuth = getAuthStatus(configDir)
   if (existingAuth.loggedIn) {
     console.log(`\x1b[32m✓ Already authenticated as ${existingAuth.email}\x1b[0m`)
-    profiles.push({ id, claudeConfigDir: configDir })
-    saveProfileConfig(profiles)
-    printEnvHint(profiles)
+    printEnvHint(createProfileSlotOrExit(id))
     return
   }
 
@@ -414,9 +661,7 @@ export async function profileAdd(id: string, options: AuthLoginOptions = {}): Pr
   console.log()
   console.log(`\x1b[32m✓ Profile "${id}" created — logged in as ${auth.email} (${auth.subscriptionType || "unknown"})\x1b[0m`)
 
-  profiles.push({ id, claudeConfigDir: configDir })
-  saveProfileConfig(profiles)
-  printEnvHint(profiles)
+  printEnvHint(createProfileSlotOrExit(id))
 }
 
 export async function profileAddOauthToken(id: string, tokenArg: string | undefined): Promise<void> {
@@ -446,27 +691,50 @@ export async function profileAddOauthToken(id: string, tokenArg: string | undefi
     process.exit(1)
   }
 
-  profiles.push({ id, type: "oauth-token", oauthToken: token })
-  saveProfileConfig(profiles)
+  profiles = withProfileConfigLockSync(profilesConfigFile(), () => {
+    const current = readProfileConfigForUpdate(profilesConfigFile())
+    if (current.some(p => p.id === id)) throw new Error(`Profile "${id}" was created while the token was being entered`)
+    const next = reclaimAlias(current, id)
+    next.push({ id, type: "oauth-token", oauthToken: token })
+    saveProfileConfig(next)
+    return next
+  })
   console.log(`\x1b[32m✓ Profile "${id}" added (OAuth token).\x1b[0m`)
   printEnvHint(profiles)
 }
 
-export function profileList(): void {
-  const profiles = loadProfileConfig()
+type ProfileListDeps = {
+  loadProfiles: typeof loadProfileConfig
+  resolveExecutable: typeof resolveClaudeExecutableSync
+  authStatus: typeof getAuthStatus
+}
+
+export function profileList(deps: ProfileListDeps = {
+  loadProfiles: loadProfileConfig,
+  resolveExecutable: resolveClaudeExecutableSync,
+  authStatus: getAuthStatus,
+}): void {
+  const profiles = deps.loadProfiles()
+  const seats = listChatGptSeats(seatContext())
   if (profiles.length === 0) {
+    if (seats.length > 0) { printChatGptSeats(seats); return }
     console.log("No profiles configured.")
     console.log("  Add one: meridian profile add <name>")
     return
   }
 
   console.log("Profiles:\n")
+  // Resolve once for this command, including a miss. A cold or hung PATH
+  // candidate must not repeat its version wait for every browser profile.
+  const resolvedForAuth = profiles.some(p => !p.oauthToken && p.type !== "oauth-token")
+    ? deps.resolveExecutable()
+    : null
   for (const p of profiles) {
     if (p.oauthToken || p.type === "oauth-token") {
       console.log(`  ${p.id.padEnd(20)} \x1b[32m✓ OAuth token\x1b[0m`)
       continue
     }
-    const auth = getAuthStatus(p.claudeConfigDir ?? "")
+    const auth = deps.authStatus(p.claudeConfigDir ?? "", resolvedForAuth)
     const status = auth.loggedIn
       ? `\x1b[32m✓ ${auth.email} (${auth.subscriptionType || "unknown"})\x1b[0m`
       : "\x1b[31m✗ not logged in\x1b[0m"
@@ -476,58 +744,60 @@ export function profileList(): void {
     }
   }
   console.log()
+  printChatGptSeats(seats)
   printEnvHint(profiles)
 }
 
-/**
- * Pure: resolve which on-disk directories should be removed when this profile
- * is deleted. Browser-login profiles drop their explicit `claudeConfigDir`
- * (provided it lives under `profilesDir`); oauth-token profiles drop the
- * pinned isolation dir at `profilesDir/<id>` (created by the SDK during use,
- * not stored on the profile itself).
- *
- * Caller is responsible for the actual `rmSync` — this returns paths only.
- */
-export function dirsToRemoveOnProfileRemove(profile: ProfileConfig, profilesDir: string): string[] {
-  const dirs: string[] = []
-  if (profile.claudeConfigDir?.startsWith(profilesDir)) {
-    dirs.push(profile.claudeConfigDir)
-  }
-  if (profile.oauthToken || profile.type === "oauth-token") {
-    const isolationDir = join(profilesDir, profile.id)
-    if (!dirs.includes(isolationDir)) dirs.push(isolationDir)
-  }
-  return dirs
+function seatContext(): SeatCliContext {
+  return { reserved: new Set(["default", ...loadProfileConfig().flatMap(p => [p.id, ...(p.aliases ?? [])])]) }
 }
 
-export function profileRemove(id: string): void {
-  const profiles = loadProfileConfig()
-  const idx = profiles.findIndex(p => p.id === id)
-  if (idx === -1) {
-    console.error(`\x1b[31m✗ Profile "${id}" not found.\x1b[0m`)
+/** Whether this name is a ChatGPT seat's and no Claude profile's: a Claude profile's name always wins, as on the server. */
+function chatGptSeatNamed(id: string): boolean {
+  if (loadProfileConfig().some(p => p.id === id || p.aliases?.includes(id))) return false
+  return findChatGptSeat(id, seatContext()) !== undefined
+}
+
+/** `add` and `login` are one operation for a ChatGPT seat: sign in an existing one again, or add one by a new name. */
+async function chatGptSignInOrExit(id: string, options: AuthLoginOptions): Promise<void> {
+  if (!await signInChatGptSeat(id, { headless: options.headless }, seatContext())) process.exit(1)
+}
+
+export async function profileRemove(id: string): Promise<void> {
+  if (chatGptSeatNamed(id)) {
+    if (!await removeChatGptSeat(id, seatContext())) process.exit(1)
+    return
+  }
+  if (envBool("CREDENTIALS_READONLY")) {
+    console.error("\x1b[31m✗ MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials.\x1b[0m")
+    console.error("  Remove the profile from the instance that owns them.")
     process.exit(1)
   }
 
-  const removed = profiles[idx]
-  if (!removed) {
-    console.error(`\x1b[31m✗ Profile "${id}" not found.\x1b[0m`)
+  const result = applyProfileRemove(id)
+  if (!result.ok) {
+    console.error(`\x1b[31m✗ ${result.error}\x1b[0m`)
+    if (result.hint) console.error(`  ${result.hint}`)
     process.exit(1)
-  }
-  const dirsToRemove = dirsToRemoveOnProfileRemove(removed, configPath("profiles"))
-  profiles.splice(idx, 1)
-  saveProfileConfig(profiles)
-
-  for (const dir of dirsToRemove) {
-    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
   }
 
   console.log(`\x1b[32m✓ Profile "${id}" removed.\x1b[0m`)
-  if (profiles.length > 0) {
-    printEnvHint(profiles)
+  for (const orphan of result.dirsOrphaned) {
+    console.error(`\x1b[33m⚠ Left behind ${orphan.dir}: ${orphan.reason}\x1b[0m`)
+  }
+  if (result.activeProfile !== undefined) {
+    console.log(result.activeProfile ? `  Active profile is now "${result.activeProfile}".` : "  No profile is active now.")
+  }
+  if (result.profiles.length > 0) {
+    printEnvHint(result.profiles)
   }
 }
 
 export function profileRename(from: string, to: string): void {
+  if (chatGptSeatNamed(from)) {
+    if (!renameChatGptSeat(from, to, seatContext())) process.exit(1)
+    return
+  }
   if (envBool("CREDENTIALS_READONLY")) {
     console.error("\x1b[31m✗ MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials.\x1b[0m")
     console.error("  Rename the profile from the instance that owns them.")
@@ -549,6 +819,10 @@ export function profileRename(from: string, to: string): void {
 }
 
 export async function profileSwitch(id: string): Promise<void> {
+  if (chatGptSeatNamed(id)) {
+    if (!switchChatGptSeat(id, seatContext())) process.exit(1)
+    return
+  }
   const port = process.env.MERIDIAN_PORT ?? process.env.CLAUDE_PROXY_PORT ?? "3456"
   const host = process.env.MERIDIAN_HOST ?? process.env.CLAUDE_PROXY_HOST ?? "127.0.0.1"
 
@@ -559,8 +833,11 @@ export async function profileSwitch(id: string): Promise<void> {
       body: JSON.stringify({ profile: id }),
       signal: AbortSignal.timeout(5000),
     })
-    const body = await res.json() as { success?: boolean; error?: string }
-    if (body.success) {
+    const body = await res.json() as { success?: boolean; error?: string; provider?: string; activeProfile?: string }
+    if (body.success && body.provider === "chatgpt") {
+      // The instance keeps its own ChatGPT pointer; the local Claude one must never name a seat.
+      console.log(`\x1b[32m✓ Active ChatGPT seat: ${body.activeProfile ?? id}\x1b[0m`)
+    } else if (body.success) {
       // Also persist locally so it survives proxy restarts
       setSetting("activeProfile", id)
       console.log(`\x1b[32m✓ Switched to profile: ${id}\x1b[0m`)
@@ -598,6 +875,7 @@ export function planProfileLogin(id: string, profiles: ProfileConfig[]): Profile
 }
 
 export async function profileLogin(id: string, options: AuthLoginOptions = {}): Promise<void> {
+  if (options.chatgpt || chatGptSeatNamed(id)) return chatGptSignInOrExit(id, options)
   const plan = planProfileLogin(id, loadProfileConfig())
 
   if (plan.action === "reject-invalid-id") {
@@ -725,18 +1003,25 @@ function printEnvHint(_profiles: ProfileConfig[]): void {
 }
 
 export function profileHelp(): void {
-  console.log(`meridian profile — manage Claude account profiles
+  console.log(`meridian profile — manage Claude account profiles and ChatGPT seats
 
 Commands:
   meridian profile add <name> [--headless]          Add a profile via Claude OAuth login
   meridian profile add <name> --oauth-token [TOKEN] Add a profile from a \`claude setup-token\` value
                                                     (if TOKEN is omitted, you will be prompted; input is hidden)
+  meridian profile add <name> --chatgpt [--headless]
+                                                    Add a ChatGPT seat via ChatGPT sign-in (--headless: a
+                                                    one-time code to enter in any browser)
   meridian profile list                             List profiles and auth status
   meridian profile rename <old> <new>               Rename a profile; <old> keeps routing to it until reused
   meridian profile remove <name>                    Remove a profile
   meridian profile switch <name>                    Switch the active profile (requires running proxy)
   meridian profile login <name> [--headless]        Re-authenticate a profile, adding it first if it does not
                                                     exist yet (claude-max only)
+
+Every command acts on a ChatGPT seat by its name, as on a Claude profile. For a
+seat, \`add\` and \`login\` are the same: an existing seat is signed in again (it must
+come back as the same account and workspace), a new name adds a seat.
 
 Examples:
   meridian profile add personal                     # Add personal account (browser login)
@@ -746,6 +1031,8 @@ Examples:
   meridian profile add ci --oauth-token sk-ant-oat01-...
                                                     # Add headless CI profile (token from CLI argument)
   meridian profile login work --headless            # Re-authenticate via OAuth URL/code prompt
+  meridian profile add work-gpt --chatgpt           # Add a ChatGPT seat
+  meridian profile login work-gpt --headless        # Sign a ChatGPT seat in again by one-time code
   meridian profile switch work                      # Switch to work account
   meridian profile rename work employer             # Rename; "work" still routes to it
   meridian profile list                             # Show all profiles`)

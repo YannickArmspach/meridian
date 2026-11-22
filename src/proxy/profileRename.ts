@@ -20,10 +20,11 @@
  * This is a leaf module — no imports from server.ts or session/.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
-import { dirname, join } from "node:path"
+import { existsSync, readFileSync, renameSync } from "node:fs"
+import { join } from "node:path"
 import { configPath } from "../configDir"
 import { getSetting, setSetting } from "../settings"
+import { publishProfileConfig, readProfileConfigForUpdate, withProfileConfigLockSync } from "./profileConfigStore"
 import type { ProfileConfig } from "./profiles"
 
 /** Profile names are restricted to exactly what `meridian profile add` accepts. */
@@ -53,8 +54,7 @@ export function loadProfileConfigFrom(file: string): ProfileConfig[] {
 }
 
 export function saveProfileConfigTo(file: string, profiles: ProfileConfig[]): void {
-  mkdirSync(dirname(file), { recursive: true })
-  writeFileSync(file, `${JSON.stringify(profiles, null, 2)}\n`, { mode: 0o600 })
+  publishProfileConfig(file, profiles)
 }
 
 /**
@@ -163,10 +163,16 @@ export function applyProfileRename(
   to: string,
   options: ApplyProfileRenameOptions = {},
 ): ApplyProfileRenameResult {
+  const configFile = options.configFile ?? defaultProfilesConfigFile()
+  try { return withProfileConfigLockSync(configFile, () => applyProfileRenameLocked(from, to, options)) }
+  catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) } }
+}
+
+function applyProfileRenameLocked(from: string, to: string, options: ApplyProfileRenameOptions): ApplyProfileRenameResult {
   const profilesDir = options.profilesDir ?? defaultProfilesDir()
   const configFile = options.configFile ?? defaultProfilesConfigFile()
 
-  const profiles = loadProfileConfigFrom(configFile)
+  const profiles = readProfileConfigForUpdate(configFile)
   const planned = planProfileRename(profiles, from, to, profilesDir)
   if (!planned.ok) return planned
   const { plan } = planned
@@ -216,6 +222,13 @@ export function applyProfileRename(
   // The active profile is stored as a name, so it has to follow the rename or
   // the instance is left pointing at a profile that no longer exists.
   if (getSetting("activeProfile") === from) setSetting("activeProfile", to)
+
+  // So is the pool order, and the alias does not save it: resolvePriorityOrder
+  // matches ids exactly, drops what it cannot match, then appends the
+  // unmatched profiles at the END. A renamed profile that was first silently
+  // becomes last - a demotion nobody asked for and nothing reports.
+  const order = getSetting("profileOrder")
+  if (order?.includes(from)) setSetting("profileOrder", order.map(id => (id === from ? to : id)))
 
   return { ok: true, from, to, aliases: plan.aliases, profiles: plan.profiles }
 }

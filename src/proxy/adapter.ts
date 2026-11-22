@@ -14,7 +14,7 @@ export type RoutingTurnIdentity = Readonly<{
   readonly turnId: string
   /** Signed wall-clock issue time used as a durable anti-replay high-water mark. */
   readonly issuedAt: number
-  readonly generation: "opencode-v1" | "opencode-v2-beta-18314"
+  readonly generation: "opencode-v1" | "opencode-v2-beta-18314" | "opencode-v2-2.0.16" | "pi-1"
 }>
 
 /**
@@ -48,6 +48,22 @@ export interface AgentIdentity {
   getParentSessionId?(c: Context, body?: unknown): string | undefined
 
   /**
+   * Optional key of the conversation this request belongs to, for clients
+   * whose subagents carry session keys of their own. Requests under one root
+   * share account routing — the sticky assignment and the priority
+   * assignment — so a subagent lands on its parent's account.
+   *
+   * Everything else stays on `getSessionId`: the session mapping, lineage,
+   * the turn lease, the session tree, the durable priority route (coupled to
+   * one session mapping) and the `[1m]` rate-limit bench (scoped per session
+   * so one limited flow never downgrades its siblings).
+   *
+   * Must return a key `getSessionId` produces for the root's own requests.
+   * Undefined, or no method, means the request is its own root.
+   */
+  getRootSessionId?(c: Context, body?: unknown): string | undefined
+
+  /**
    * Optional client-declared agent mode. Adapters own their header/protocol
    * details; the proxy uses the normalized value for model-tier selection.
    */
@@ -65,6 +81,17 @@ export interface AgentIdentity {
    * stale branch, and refusing it is what stops two histories from merging.
    */
   readonly runsConcurrentTurnsPerSessionKey?: boolean
+
+  /**
+   * True when this request is a client side call that carries the
+   * conversation's session key without being a turn of that conversation.
+   *
+   * Such a request skips lineage lookup and never publishes, evicts or
+   * recovers the session mapping, and never takes the session turn lease: it
+   * has no turn to serialize. Undefined or false keeps normal session handling, which is
+   * what every client that separates its side calls by key already gets.
+   */
+  isAuxiliaryRequest?(c: Context, body?: unknown): boolean
 
   /**
    * Optional trusted identity for a visible human turn.
@@ -156,6 +183,15 @@ export interface AgentIdentity {
   getPassthroughMcpName?(): string
 }
 
+/** The account-routing key for a request: its declared root, else its own session key. */
+export function rootSessionIdOf(
+  adapter: Pick<AgentIdentity, "getSessionId" | "getRootSessionId">,
+  c: Context,
+  body?: unknown,
+): string | undefined {
+  return adapter.getRootSessionId?.(c, body) ?? adapter.getSessionId(c, body)
+}
+
 /**
  * An agent adapter provides agent-specific configuration to the proxy.
  * The proxy calls these methods during request handling to determine
@@ -245,19 +281,19 @@ export interface AgentAdapter extends AgentIdentity {
   getCoreToolNames?(): readonly string[]
 
   /**
-   * SDK setting sources to load for this agent.
+   * SDK setting sources for SDK-owned tool execution.
    *
    * Controls whether CLAUDE.md files, user settings, and project settings
-   * are loaded by the SDK subprocess. This is what makes Claude "know"
-   * about your project instructions and personal preferences.
+   * are loaded by the SDK subprocess outside passthrough. Passthrough always
+   * uses an empty list because client-owned tools and instructions must not
+   * inherit executable integrations or guidance from the proxy host.
    *
    * - `['user', 'project']` — load ~/.claude/CLAUDE.md and .claude/CLAUDE.md
    * - `['project']` — load only project-level CLAUDE.md
    * - `[]` or undefined — isolation mode (no filesystem settings loaded)
    *
-   * Agents that manage their own context (OpenCode, ForgeCode) should return
-   * empty/undefined. Agents that want full Claude Code behavior (Crush, Pi)
-   * should return `['user', 'project']`.
+   * This preference and the claudeMd feature selection are ignored during
+   * client-owned passthrough; explicit SDK hooks and memory settings remain.
    */
   getSettingSources?(): SettingSource[]
 
