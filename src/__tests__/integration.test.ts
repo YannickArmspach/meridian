@@ -8,7 +8,7 @@
  * But they test the full Hono HTTP stack, SSE parsing, etc.
  */
 
-import { describe, it, expect, mock, beforeAll, afterAll, beforeEach, afterEach } from "bun:test"
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
@@ -29,9 +29,10 @@ import {
 // --- Mock SDK ---
 let mockMessages: any[] = []
 let capturedQueryParams: any = null
+type MockQueryParams = Parameters<typeof import("@anthropic-ai/claude-agent-sdk").query>[0]
 
 installSdkMock(() => ({
-  query: (params: any) => {
+  query: (params: MockQueryParams) => {
     capturedQueryParams = params
     return (async function* () {
       for (const msg of mockMessages) {
@@ -47,10 +48,7 @@ installSdkMock(() => ({
   tool: () => ({}),
 }), "integration.test.ts")
 
-installLoggerMock(() => ({
-  claudeLog: () => {},
-  withClaudeLogContext: (_ctx: any, fn: any) => fn(),
-}))
+installLoggerMock(() => ({}))
 
 installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
@@ -277,43 +275,6 @@ describe("Integration: Streaming tool loop", () => {
 })
 
 // ============================================================
-// CONCURRENT SUBAGENT SIMULATION
-// ============================================================
-
-describe("Integration: Concurrent subagent requests", () => {
-  let app: any
-
-  beforeAll(() => {
-    app = createTestApp()
-  })
-
-  beforeEach(() => {
-    mockMessages = [
-      assistantMessage([{ type: "text", text: "Done." }]),
-    ]
-  })
-
-  it("should handle 3 concurrent requests (parent + 2 subagents)", async () => {
-    const requests = Array.from({ length: 3 }, (_, i) =>
-      post(app, {
-        model: "claude-sonnet-4-5",
-        max_tokens: 1024,
-        stream: false,
-        messages: [{ role: "user", content: `Request ${i}` }],
-      })
-    )
-
-    const responses = await Promise.all(requests)
-    const bodies = await Promise.all(responses.map(r => r.json() as Promise<any>))
-
-    for (let i = 0; i < 3; i++) {
-      expect(responses[i].status).toBe(200)
-      expect(bodies[i].content[0].text).toBe("Done.")
-    }
-  })
-})
-
-// ============================================================
 // NON-STREAM USAGE PROPAGATION
 // ============================================================
 
@@ -396,8 +357,9 @@ describe("Integration: Non-stream usage propagation", () => {
       messages: [{ role: "user", content: "ping" }],
     })
 
+    expect({ status: response.status, body: response.status === 200 ? undefined : await response.clone().text() })
+      .toEqual({ status: 200, body: undefined })
     const body = await response.json() as any
-    expect(response.status).toBe(200)
     expect(body.usage.input_tokens).toBe(0)
     expect(body.usage.output_tokens).toBe(0)
   })

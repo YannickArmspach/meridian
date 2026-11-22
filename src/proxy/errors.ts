@@ -4,6 +4,7 @@
  */
 
 import type { AbortCauseSnapshot } from "./requestAbort"
+import { parseToolInputObject } from "./toolInputJson"
 
 export interface ClassifiedError {
   status: number
@@ -77,6 +78,26 @@ const BILLING_SIGNALS: readonly RegExp[] = [
   // echoing the sentence mid-line must not trigger it.
   /^\s*(?:(?:error|api error|claude code returned an error result|subprocess stderr):\s*)*your (?:group|organization|org)(?:'|’)s usage limit is set to \$\d/m,
 ]
+
+const EXTRA_USAGE_REFUSAL = /^(?:(?:you(?:'|’)re|you are) out of(?: your)? extra usage\b|third-party apps(?: now)? draws? from(?: your)? extra usage\b)/i
+const ERROR_WRAPPERS = /^\s*(?:(?:error|api error|claude code returned an error result|subprocess stderr):\s*)*(?:\d{3}\s+)?/i
+const MAX_QUOTED_REFUSAL = 300
+
+/** Anthropic's own sentence for an Extra Usage refusal, without the SDK's
+ *  wrappers, or null when the error is some other billing refusal.
+ *
+ *  These refusals ("You're out of extra usage", "Third-party apps now draw
+ *  from extra usage, not plan limits") say which pool a request was charged
+ *  to and what to do about it. Answered with the generic subscription text,
+ *  they read as a lapsed subscription on an account that is in good standing. */
+function extraUsageRefusal(errMsg: string): string | null {
+  // Only the primary recognized refusal supplies client-facing provider text.
+  // A different billing failure can include tool output or diagnostic context
+  // that merely mentions Extra Usage; none of that establishes its cause.
+  const sentence = errMsg.replace(ERROR_WRAPPERS, "").trimStart().split(/\r?\n/, 1)[0]!.trim()
+  if (!EXTRA_USAGE_REFUSAL.test(sentence)) return null
+  return sentence.length > MAX_QUOTED_REFUSAL ? `${sentence.slice(0, MAX_QUOTED_REFUSAL)}…` : sentence
+}
 
 /** The org-admin entitlement switch: "Your organization has disabled Claude
  *  subscription access for Claude Code · Use an Anthropic API key instead, or
@@ -175,6 +196,12 @@ const HIT_YOUR_SPEND_LIMIT = /^\s*(?:(?:error|api error|claude code returned an 
  * the negative cases below turn on exactly that distinction: a documentation
  * sentence continuing past the banner must not exhaust a healthy profile.
  *
+ * When usage credits can be bought, the CLI splices a link into that prose:
+ * "Switch to another model, or manage usage credits at <url>, to continue."
+ * (Claude Code 2.1.322; the URL is claude.ai/settings/usage for personal
+ * plans and claude.ai/admin-settings/usage for team/enterprise). Only a
+ * claude.ai URL is accepted in that slot, for the same reason.
+ *
  * The bound is the LINE, not the message — `/m`, like HIT_YOUR_SPEND_LIMIT
  * above and CONTEXT_OVERFLOW_SIGNALS below. `server.ts` appends captured
  * stderr to `Error.message` before classification, so a message-final anchor
@@ -184,7 +211,7 @@ const HIT_YOUR_SPEND_LIMIT = /^\s*(?:(?:error|api error|claude code returned an 
  * always, the harmless "custom betas" warning being emitted first. Both shapes
  * then fell through to the code-1 branch, which tells the operator to run
  * `claude login` for what is actually a quota refusal. */
-const REACHED_YOUR_TIER_LIMIT = /^[ \t]*(?:(?:error|api error|claude code returned an error result|subprocess stderr):[ \t]*)*(?:\d{3}[ \t]+)?you(?:'|’)ve reached your (?:claude )?(?:fable|mythos|opus|sonnet|haiku)(?: \d+(?:\.\d+)*)? limit(?:(?:[.!][ \t]+|[ \t]+)(?:(?:run[ \t]+)?\/usage-credits(?:[ \t]+to[ \t]+continue)?(?:[ \t]+or[ \t]+switch[ \t]+models[ \t]+with[ \t]+\/model)?|\/model[ \t]+to[ \t]+switch[ \t]+models|switch[ \t]+to[ \t]+another[ \t]+model(?:[ \t]+to[ \t]+continue)?)\.?|[.!]?)[ \t\r]*$/m
+const REACHED_YOUR_TIER_LIMIT = /^[ \t]*(?:(?:error|api error|claude code returned an error result|subprocess stderr):[ \t]*)*(?:\d{3}[ \t]+)?you(?:'|’)ve reached your (?:claude )?(?:fable|mythos|opus|sonnet|haiku)(?: \d+(?:\.\d+)*)? limit(?:(?:[.!][ \t]+|[ \t]+)(?:(?:run[ \t]+)?\/usage-credits(?:[ \t]+to[ \t]+continue)?(?:[ \t]+or[ \t]+switch[ \t]+models[ \t]+with[ \t]+\/model)?|\/model[ \t]+to[ \t]+switch[ \t]+models|switch[ \t]+to[ \t]+another[ \t]+model(?:,[ \t]+or[ \t]+manage[ \t]+usage[ \t]+credits[ \t]+at[ \t]+https:\/\/claude\.ai\/[^\s,]+,)?(?:[ \t]+to[ \t]+continue)?)\.?|[.!]?)[ \t\r]*$/m
 
 /**
  * The CLI's refusal when a turn hit the output-token maximum.
@@ -305,7 +332,11 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
   const lower = errMsg.toLowerCase()
 
   // Expired OAuth token (more specific than the generic auth check below)
-  if (lower.includes("oauth token has expired") || lower.includes("not logged in")) {
+  if (
+    lower.includes("oauth token has expired")
+    || lower.includes("oauth access token has expired")
+    || lower.includes("not logged in")
+  ) {
     return {
       status: 401,
       type: "authentication_error",
@@ -371,6 +402,14 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
   // isAccountFailoverError started keying on it (#796) — at which point an
   // MCP server's stderr could mark every profile in the pool exhausted.
   if (BILLING_SIGNALS.some(rx => rx.test(lower))) {
+    const extraUsage = extraUsageRefusal(errMsg)
+    if (extraUsage) {
+      return {
+        status: 402,
+        type: "billing_error",
+        message: `Claude returned an Extra Usage refusal: "${extraUsage}"`
+      }
+    }
     return {
       status: 402,
       type: "billing_error",
@@ -388,18 +427,21 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
   // "transient, try again" to every client retry policy, so an overflow that
   // can only ever fail identically gets replayed at full upstream cost. 400
   // says the request itself is the problem.
+  // Keep Anthropic's canonical "prompt is too long" signal: clients such as
+  // OpenCode use it to distinguish overflow from other invalid requests and
+  // compact reactively, even below their advertised context-window threshold.
   if (CONTEXT_OVERFLOW_SIGNALS.some(rx => rx.test(lower))) {
     return {
       status: 400,
       type: "invalid_request_error",
-      message: "Prompt exceeds the model's context window. Compact or trim the conversation before retrying — an identical retry fails the same way."
+      message: "Prompt is too long for the model's context window. Compact or trim the conversation before retrying — an identical retry fails the same way."
     }
   }
 
   // The resolved CLI predates the requested model. A correct package.json floor
-  // does not prevent this: MERIDIAN_CLAUDE_PATH is step 0 of
-  // resolveClaudeExecutableWithSource, so an env-pointed CLI outranks the
-  // bundled binary the floor governs (#932).
+  // does not prevent this: the floor governs only the bundled binary, and the
+  // resolver may run another - the `claude` on PATH (the default), a path
+  // chosen in Settings, or MERIDIAN_CLAUDE_PATH, which outranks both (#932).
   //
   // 400 for the same reason as context overflow above — upgrading the CLI is
   // the only fix, so every retry fails identically, and the default 500 reads
@@ -414,14 +456,27 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
     return {
       status: 400,
       type: "invalid_request_error",
-      message: `${errMsg.trim()} (Meridian: the Claude Code CLI it resolved is older than the requested model. If MERIDIAN_CLAUDE_PATH is set it overrides the bundled CLI, so update that binary or unset the variable.)`
+      message: `${errMsg.trim()} (Meridian: the Claude Code CLI it resolved is older than the requested model. Update that installation, or choose a newer one under Settings, Claude Code Executable. MERIDIAN_CLAUDE_PATH, when set, overrides that choice.)`
     }
   }
 
   // SDK process crash
-  if (lower.includes("exited with code") || lower.includes("process exited")) {
+  // Only the SDK's own termination line names the signal, never text quoted in
+  // appended subprocess stderr.
+  const stoppedSignal = (errMsg.split(/subprocess stderr:/i)[0] ?? "").match(/process terminated by signal (SIGTERM|SIGKILL)\b/)?.[1]
+  if (lower.includes("exited with code") || lower.includes("process exited") || stoppedSignal) {
     const codeMatch = errMsg.match(/exited with code (\d+)/)
     const code = codeMatch ? codeMatch[1] : "unknown"
+
+    // External stops (restart or OOM kill) are transient, not expired logins.
+    if (code === "143" || code === "137" || stoppedSignal) {
+      const reason = stoppedSignal ? `signal ${stoppedSignal}` : `exit code ${code}`
+      return {
+        status: 503,
+        type: "api_error",
+        message: `Service temporarily unavailable: the Claude Code process serving this request was stopped by a signal (${reason}), as happens when Meridian restarts or the process is killed for memory. Retry the request.`
+      }
+    }
 
     // If stderr was captured it will be appended to the message — use it for classification
     const hasStderr = lower.includes("subprocess stderr:")
@@ -462,12 +517,18 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
     (lower.includes("timed out waiting for") && lower.includes(".lock"))
     || lower.includes("ownership backlog is full")
     || lower.includes("ownership capacity is full")
+    || lower.includes("lifecycle queue capacity reached")
+    || lower.includes("active lifecycle holder stalled")
   ) {
     const reason = lower.includes("ownership backlog is full")
       ? "the retirement backlog is full"
       : lower.includes("ownership capacity is full")
         ? "the ownership capacity is full"
-        : "a bookkeeping lock is busy"
+        : lower.includes("lifecycle queue capacity reached")
+          ? "the bookkeeping queue is full"
+          : lower.includes("active lifecycle holder stalled")
+            ? "an active bookkeeping transaction has stalled"
+            : "a bookkeeping lock is busy"
     return {
       status: 503,
       type: "overloaded_error",
@@ -515,9 +576,9 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
  * Triggers an inline token refresh + retry in server.ts.
  *
  * Patterns, in order of specificity:
- *   - "OAuth token has expired" / "Not logged in" — CLI-emitted (subprocess
- *     either got 401 with this wording from Anthropic or detected expiry
- *     locally before sending).
+ *   - "OAuth token has expired" / "OAuth access token has expired" / "Not
+ *     logged in" — CLI-emitted (subprocess either got 401 with this wording
+ *     from Anthropic or detected expiry locally before sending).
  *   - "invalid_token" / "token_expired" — RFC 6750 resource-server errors that
  *     can appear in the API response body.
  *   - "401" + ("authentication" | "unauthorized" | "invalid") — generic 401
@@ -531,7 +592,11 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
  */
 export function isExpiredTokenError(errMsg: string): boolean {
   const lower = errMsg.toLowerCase()
-  if (lower.includes("oauth token has expired") || lower.includes("not logged in")) return true
+  if (
+    lower.includes("oauth token has expired")
+    || lower.includes("oauth access token has expired")
+    || lower.includes("not logged in")
+  ) return true
   if (lower.includes("invalid_token") || lower.includes("token_expired")) return true
   if (lower.includes("401") && (lower.includes("authentication") || lower.includes("unauthorized") || lower.includes("invalid"))) return true
   return false
@@ -564,6 +629,7 @@ export type ResumeRefusal = "busy" | "unresumable" | "missing-message"
  */
 export function classifyResumeRefusal(error: unknown, stderr?: string): ResumeRefusal | undefined {
   if (isBusySessionError(error, stderr)) return "busy"
+  if (stderr?.includes("No message found with message.uuid")) return "missing-message"
   if (!(error instanceof Error)) return undefined
   const msg = error.message
   if (msg.includes("No message found with message.uuid")) return "missing-message"
@@ -757,39 +823,79 @@ export interface StreamedToolBlockRecord {
   naturalStop: boolean
 }
 
+export interface AssistantRefusal {
+  readonly stopDetails: object | null
+}
+
+/** Reads Claude Code's structured refusal row; its error text changes wording between versions. */
+export function assistantRefusalOf(row: {
+  readonly parent_tool_use_id?: string | null
+  readonly message: { readonly stop_reason?: string | null; readonly stop_details?: unknown }
+}): AssistantRefusal | null {
+  if (row.parent_tool_use_id || row.message.stop_reason !== "refusal") return null
+  const details = row.message.stop_details
+  return { stopDetails: typeof details === "object" ? details : null }
+}
+
+/** Why a streamed-but-uncaptured tool call is not complete and executable. */
+export type StreamedToolBlockVeto = "unforwarded" | "unclosed" | "incomplete_json"
+
 /**
- * Is a streamed-but-uncaptured tool call complete and executable?
- * Pure function — no I/O.
+ * Which completeness condition a streamed-but-uncaptured tool call fails,
+ * or undefined when it is complete and executable. Pure function — no I/O.
+ *
+ * The arguments may hold raw control characters or invalid escapes inside
+ * string literals: fine-grained tool streaming passes model JSON through
+ * unvalidated, and the client repairs those defects the same way
+ * (see toolInputJson.ts). Truncated JSON and non-object roots still fail.
  */
+export function streamedToolBlockVeto(
+  record: StreamedToolBlockRecord,
+): StreamedToolBlockVeto | undefined {
+  if (!record.forwardedStart) return "unforwarded"
+  if (!record.naturalStop) return "unclosed"
+  // A block_start may carry `{}` before its actual JSON deltas. If deltas
+  // arrived, validate them rather than treating that placeholder as input.
+  if (!record.json.trim()) return record.startedInputObject ? undefined : "incomplete_json"
+  return parseToolInputObject(record.json) ? undefined : "incomplete_json"
+}
+
+/** Is a streamed-but-uncaptured tool call complete and executable? */
 export function isStreamedToolBlockComplete(
   record: StreamedToolBlockRecord,
 ): boolean {
-  if (!record.forwardedStart) return false
-  if (!record.naturalStop) return false
-  // A block_start may carry `{}` before its actual JSON deltas. If deltas
-  // arrived, validate them rather than treating that placeholder as input.
-  if (!record.json.trim()) return record.startedInputObject
-  try {
-    const parsed = JSON.parse(record.json)
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-  } catch {
-    return false
-  }
+  return streamedToolBlockVeto(record) === undefined
 }
+
+// Claude Code refuses these calls before PreToolUse and before execution, so
+// each proves the call never ran. Name dispatch: the model used a bare client
+// name. Unparseable input: fine-grained streaming delivered arguments that the
+// CLI could not parse (for example a raw tab inside a string). Schema
+// validation failures are deliberately absent: their input parsed, so the
+// call is not merely undelivered but wrong, and the model must correct it.
+const CLI_REJECTION_PATTERNS: readonly RegExp[] = [
+  /^<tool_use_error>Error: No such tool available: ([^<>]+)<\/tool_use_error>$/,
+  /^<tool_use_error>InputValidationError: ([^\s<>]+) was called with input that could not be parsed as JSON\.\n[\s\S]*<\/tool_use_error>$/,
+]
 
 /** CLI dispatch rejection, keyed by the exact tool-use id and name. A generic
  * failed tool_result is not evidence that a call was never executed. */
-export function unavailableToolResults(content: unknown): Array<{ id: string; name: string }> {
+export function cliRejectedToolResults(content: unknown): Array<{ id: string; name: string }> {
   if (!Array.isArray(content)) return []
-  const unavailable: Array<{ id: string; name: string }> = []
+  const rejected: Array<{ id: string; name: string }> = []
   for (const block of content) {
     if (!block || typeof block !== "object" || block.type !== "tool_result" ||
       block.is_error !== true || typeof block.tool_use_id !== "string" ||
       typeof block.content !== "string") continue
-    const name = /^<tool_use_error>Error: No such tool available: ([^<>]+)<\/tool_use_error>$/.exec(block.content)?.[1]
-    if (name) unavailable.push({ id: block.tool_use_id, name })
+    for (const pattern of CLI_REJECTION_PATTERNS) {
+      const name = pattern.exec(block.content)?.[1]
+      if (name) {
+        rejected.push({ id: block.tool_use_id, name })
+        break
+      }
+    }
   }
-  return unavailable
+  return rejected
 }
 
 /**
@@ -797,17 +903,59 @@ export function unavailableToolResults(content: unknown): Array<{ id: string; na
  * were NEVER captured by the PreToolUse hook still be delivered as a
  * tool-use response?
  *
- * Two distinct cases: a CLI dispatch rejection ("No such tool available")
- * for every streamed call proves none executed, even if its error results
+ * Two distinct cases: a CLI dispatch rejection ("No such tool available" or
+ * unparseable input, see cliRejectedToolResults) for every streamed call
+ * proves none executed, even if its error results
  * settled the early-stop tracker. Separately, the opt-in abort-window path
  * covers calls that fully streamed but produced no hook or rejection result.
  * Neither case can reuse the SDK's rejected transcript; callers evict it
  * before authorizing the client to execute the tools.
  *
- * Callers must also verify the one-turn cap, no cancellation, an open
- * envelope, complete blocks, and names declared by the client.
+ * The explicit rejection holds at any turn budget this proxy set. With
+ * deferred tools the budget is above one, so after the rejection the SDK
+ * keeps going: the model retries under the registered name (dropped as the
+ * hidden digest) or the bare name again (rejected again) until the budget
+ * runs out. Neither retry reached the client or ran, and a drop can only come
+ * from a call the hook saw — never from one of the rejected, forwarded calls —
+ * so drops do not veto a confirmed rejection. The opt-in path has no such
+ * proof and stays at the one-turn cap with no drops.
+ *
+ * Callers must also verify no cancellation, an open envelope and complete
+ * blocks. The opt-in path additionally requires names the client declared;
+ * a confirmed rejection does not, because the client answers an unknown name
+ * itself and the rejection already proves the call ran nowhere.
  */
-export function canRecoverUncapturedToolUses(input: {
+export function canRecoverUncapturedToolUses(input: UncapturedRecoveryInput): boolean {
+  return uncapturedRecoveryVeto(input) === undefined
+}
+
+export type UncapturedRecoveryVeto =
+  | "disabled"
+  | "not_passthrough"
+  | "not_max_turns"
+  | "turn_budget"
+  | "captured"
+  | "nothing_streamed"
+  | "dropped"
+  | "duplicate"
+  | "forced_single"
+  | "early_stop"
+
+/** Every condition the streaming caller can name in the `uncaptured_veto=`
+ * log field: the predicate's vetoes, a block's vetoes, and the envelope and
+ * declaration checks the caller makes itself. */
+export type UncapturedDeliveryVeto =
+  | UncapturedRecoveryVeto
+  | StreamedToolBlockVeto
+  | "envelope_unopened"
+  | "stream_closed"
+  | "terminal_delta"
+  | "durable_writes_revoked"
+  | "aborted"
+  | "undeclared_tool"
+  | "untracked_block"
+
+export interface UncapturedRecoveryInput {
   reason: SdkTermination["reason"]
   passthrough: boolean
   capturedToolUses: number
@@ -817,24 +965,33 @@ export function canRecoverUncapturedToolUses(input: {
   forceSingleToolUse: boolean
   earlyStopFired: boolean
   uncapturedRecoveryEnabled: boolean
-  /** Every forwarded call was explicitly rejected by CLI dispatch. */
+  /** Every forwarded call was explicitly rejected by CLI dispatch
+   * (cliRejectedToolResults), so none of them ran. */
   confirmedToolUnavailable: boolean
   attemptedMaxTurns: number | undefined
-}): boolean {
-  if (!input.uncapturedRecoveryEnabled && !input.confirmedToolUnavailable) return false
-  if (!input.passthrough) return false
-  if (input.reason !== "max_turns") return false
-  // Only a turn this proxy capped at 1 qualifies; an uncapped budget that
-  // ran out is a different failure, and a cap-lifted reissue is already a
-  // second attempt at recovery.
-  if (input.attemptedMaxTurns !== 1) return false
-  if (input.capturedToolUses > 0) return false
-  if (input.streamedToolUses <= 0) return false
-  if (input.droppedToolUseIds > 0) return false
-  if (input.sawDuplicateToolUse) return false
-  if (input.forceSingleToolUse) return false
-  if (input.earlyStopFired && !input.confirmedToolUnavailable) return false
-  return true
+}
+
+/**
+ * The first condition that keeps canRecoverUncapturedToolUses from
+ * recovering, or undefined when it may. The name goes into the failure log,
+ * so an unrecovered turn can be diagnosed from telemetry alone.
+ */
+export function uncapturedRecoveryVeto(input: UncapturedRecoveryInput): UncapturedRecoveryVeto | undefined {
+  if (!input.uncapturedRecoveryEnabled && !input.confirmedToolUnavailable) return "disabled"
+  if (!input.passthrough) return "not_passthrough"
+  if (input.reason !== "max_turns") return "not_max_turns"
+  if (input.attemptedMaxTurns === undefined) return "turn_budget"
+  // Without an explicit rejection, only a turn this proxy capped at 1
+  // qualifies; an uncapped budget that ran out is a different failure, and a
+  // cap-lifted reissue is already a second attempt at recovery.
+  if (!input.confirmedToolUnavailable && input.attemptedMaxTurns !== 1) return "turn_budget"
+  if (input.capturedToolUses > 0) return "captured"
+  if (input.streamedToolUses <= 0) return "nothing_streamed"
+  if (input.droppedToolUseIds > 0 && !input.confirmedToolUnavailable) return "dropped"
+  if (input.sawDuplicateToolUse) return "duplicate"
+  if (input.forceSingleToolUse) return "forced_single"
+  if (input.earlyStopFired && !input.confirmedToolUnavailable) return "early_stop"
+  return undefined
 }
 
 export function extractSdkTermination(errMsg: string): SdkTermination {

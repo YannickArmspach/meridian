@@ -105,6 +105,8 @@ export interface ProfileListPayload {
   routing?: string
   profileOrder?: string[]
   exhausted?: { id?: string; until?: number }[]
+  /** Present on an instance that serves ChatGPT seats. */
+  chatgpt?: unknown
 }
 
 export interface SummaryPayload {
@@ -323,20 +325,14 @@ function buildAccounts(input: CliDashboardInput, now: number): AccountBlock[] {
       const id = p.id ?? "default"
       candidates.push({ id, label: id, isActive: p.isActive === true, configured: true })
     }
-  } else {
+  } else if (input.health?.auth?.loggedIn || !input.profileList?.chatgpt) {
+    // The ambient Claude login is the one account. Any other id in the
+    // telemetry - a seat no longer configured, a store no longer followed -
+    // is history, not an account, and an instance serving only ChatGPT has
+    // no ambient account at all.
     const auth = input.health?.auth
     const email = (auth?.loggedIn && auth.email) || ""
-    const seen = new Set<string>()
-    for (const key of [...Object.keys(quotaByProfile), ...Object.keys(byProfile)]) {
-      if (seen.has(key)) continue
-      seen.add(key)
-      candidates.push({
-        id: key,
-        label: key === "default" ? email || "account" : key,
-        isActive: false,
-        configured: false,
-      })
-    }
+    candidates.push({ id: "default", label: email || "account", isActive: false, configured: false })
   }
 
   const isPriority = input.profileList?.routing === "priority"
@@ -401,8 +397,8 @@ function buildAccounts(input: CliDashboardInput, now: number): AccountBlock[] {
         })
       }
     } else if (candidate.isActive) {
-      // `.active-pill` — the one badge the page shows in the default mode.
-      // Its sibling, the "Click to activate" hover hint, is a browser
+      // The page's "Active" strip across the active card's top edge.
+      // Its sibling, the "Click to activate" hover strip, is a browser
       // affordance and has no terminal equivalent, so it is dropped.
       badges.push({ text: "ACTIVE", color: "accent" })
     }

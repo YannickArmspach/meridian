@@ -8,12 +8,21 @@
  * return to the preferred profile), exhaustion skip, and that the mode OFF
  * is byte-identical to today's behavior.
  */
-import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { describe, it, expect, mock, spyOn, beforeEach, afterEach } from "bun:test"
+import { createAdaptorServer } from "@hono/node-server"
+import type { AddressInfo } from "node:net"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { fetchOAuthUsage, fetchOAuthUsageResult, peekOAuthUsage, resetOAuthUsageCache } from "../proxy/oauthUsage"
 import { installSdkMock } from "./sdkMock"
+import { createOwnedCredentialStore } from "./modelsMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
-import { assistantMessage, messageStart, textBlockStart, textDelta, blockStop, messageDelta, messageStop, resolveMockSdkSessionId } from "./helpers"
+import { assistantMessage, messageStart, textBlockStart, textDelta, blockStop, messageDelta, messageStop, resolveMockSdkSessionId, streamEvent } from "./helpers"
 import { createPriorityAttestation } from "../../plugin/priority-attestation"
+import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript"
+import { requestOptions } from "../../plugin/pi/headers"
 import type { PriorityFailbackPolicy } from "../proxy/routing"
 import type { DurablePriorityAssignment } from "../proxy/sessionStore"
 
@@ -64,9 +73,26 @@ let capturedEnvs: string[] = []
 let capturedSdkCalls: CapturedSdkCall[] = []
 let capturePhase = 0
 let failingDirs = new Set<string>()
+// Accounts that refuse only one model: dir fragment -> SDK model substring.
+let failingModelDirs = new Map<string, string>()
 // Accounts that fail only AFTER streaming some content — the error frame then
 // lands behind message_start, where the sniffer must not touch it.
 let failAfterContentDirs = new Set<string>()
+// SDK pings before an account error/success are discarded by the idle guard.
+// They must not turn a pending account into an accepted stream. The proxy's
+// independent 15s downstream heartbeat is exercised separately below.
+let preludePingDirs = new Set<string>()
+let preludePingSucceedDirs = new Set<string>()
+// Accounts that sleep this long before refusing — long enough for the proxy
+// heartbeat to emit `: ping` into the stream first. Scoped per account so a
+// failover target serves immediately.
+let preludeHeartbeatDirs = new Map<string, number>()
+// Accounts that neither answer nor refuse: the client is held on keepalives
+// alone until it cancels.
+let silentForeverDirs = new Set<string>()
+let activeSilentCalls = 0
+let signalAccountPending = (): void => {}
+let delayedRefusals = 0
 type ExposureBeforeFailureKind = "tool" | "structured"
 let exposureBeforeFailureDirs = new Map<string, ExposureBeforeFailureKind>()
 let noncanonicalToolFailureDirs = new Set<string>()
@@ -165,7 +191,45 @@ installSdkMock(() => ({
           // must return a replayable error body without trying another profile.
           throw new Error(failureMessage)
         }
+        if ([...silentForeverDirs].some((f) => dir.includes(f))) {
+          // A pending account that only yields keepalives until SDK abort.
+          activeSilentCalls++
+          try {
+            yield withReturnedSessionId(streamEvent({ type: "ping" }))
+            const signal: AbortSignal | undefined = params.options?.abortController?.signal
+            if (!signal) throw new Error("silent fixture requires SDK abort signal")
+            await new Promise<void>((_resolve, reject) => {
+              if (signal.aborted) reject(new Error("aborted"))
+              else signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true })
+            })
+          } finally {
+            activeSilentCalls--
+          }
+          return
+        }
+        const heartbeatDelay = [...preludeHeartbeatDirs.entries()]
+          .find(([fragment]) => dir.includes(fragment))?.[1] ?? 0
+        if (heartbeatDelay > 0) {
+          // The proxy's heartbeat interval (15s) fires while this account is
+          // still deciding, so the error frame lands BEHIND the comment.
+          signalAccountPending()
+          await new Promise(resolve => setTimeout(resolve, heartbeatDelay))
+          delayedRefusals++
+          throw new Error(failureMessage)
+        }
+        if ([...preludePingDirs].some((f) => dir.includes(f))) {
+          if (streaming) {
+            signalAccountPending()
+            yield withReturnedSessionId(streamEvent({ type: "ping" }))
+            await new Promise(resolve => setTimeout(resolve, 300))
+          }
+          throw new Error(failureMessage)
+        }
         if ([...failingDirs].some((f) => dir.includes(f))) {
+          throw new Error(failureMessage)
+        }
+        const sdkModel = String(params.options?.model ?? "")
+        if ([...failingModelDirs].some(([f, model]) => dir.includes(f) && sdkModel.includes(model))) {
           throw new Error(failureMessage)
         }
         if ([...failAfterContentDirs].some((f) => dir.includes(f))) {
@@ -177,6 +241,9 @@ installSdkMock(() => ({
           throw new Error(failureMessage)
         }
         if (streaming) {
+          if ([...preludePingSucceedDirs].some((f) => dir.includes(f))) {
+            yield withReturnedSessionId(streamEvent({ type: "ping" }))
+          }
           yield withReturnedSessionId(messageStart("msg-1"))
           const completionGate = streamCompletionGate
           if (completionGate !== null && completionGate.phase === phase) {
@@ -215,6 +282,7 @@ const { resetActiveProfile } = await import("../proxy/profiles")
 const { __setFetchOAuthUsageOverride } = await import("../proxy/oauthUsage")
 const { rateLimitStore } = await import("../proxy/rateLimitStore")
 const { loadSettings, saveSettings } = await import("../settings")
+const { rememberOrganization } = await import("../proxy/organizationName")
 const {
   evictSharedSession,
   lookupPriorityAssignmentResult,
@@ -260,6 +328,46 @@ function trustedOpenCodeTurnHeaders(
   }
 }
 
+/**
+ * Headers the Meridian Pi extension sends for a turn of a root Pi session,
+ * produced by the extension's own request shaping and final-hook signer.
+ */
+function trustedPiTurnHeaders(
+  sessionId: string,
+  humanMessageId: string,
+  source?: string,
+): Record<string, string> {
+  const clockKey = `pi:${sessionId}`
+  const previous = testTurnClock.get(clockKey)
+  const issuedAt = previous?.humanMessageId === humanMessageId
+    ? previous.issuedAt
+    : Math.max(Math.floor(Date.now() / 1000), (previous?.issuedAt ?? 0) + 1)
+  testTurnClock.set(clockKey, { humanMessageId, issuedAt })
+  const session = {
+    getSessionId: () => sessionId,
+    getHeader: () => null,
+    getBranch: () => [{ type: "message", id: humanMessageId, message: { role: "user", timestamp: issuedAt * 1000 } }],
+  }
+  const shaped = requestOptions(
+    normalizeContext({ messages: [] }),
+    { sessionId, headers: source ? { "x-meridian-source": source } : {} },
+    { session },
+    PRIORITY_ATTESTATION_TEST_KEY,
+  ).headers ?? {}
+  const headers: Record<string, string> = {}
+  for (const [name, value] of Object.entries(shaped)) if (value !== null) headers[name] = value
+  return headers
+}
+
+async function assignPiToFallback(app: TestApp, sessionId: string): Promise<void> {
+  process.env.MERIDIAN_PROFILE_ORDER = "personal,work"
+  const response = await post(app, trustedPiTurnHeaders(sessionId, "a1b2c3d4"), OPENING_MESSAGE)
+  await response.json()
+  process.env.MERIDIAN_PROFILE_ORDER = "work,personal"
+  capturedEnvs = []
+  capturedSdkCalls = []
+}
+
 function durableRoute(sessionId: string): DurablePriorityAssignment {
   const route = lookupPriorityAssignmentResult(`opencode:${sessionId}`)
   if (route.status !== "found") throw new Error(`durable route is ${route.status}`)
@@ -302,6 +410,7 @@ type PostMessagesOptions = {
   readonly stream: boolean
   readonly signal?: AbortSignal
   readonly tools?: readonly Record<string, unknown>[]
+  readonly model?: string
 }
 
 async function postMessages(app: TestApp, options: PostMessagesOptions): Promise<Response> {
@@ -311,7 +420,7 @@ async function postMessages(app: TestApp, options: PostMessagesOptions): Promise
     method: "POST",
     headers: { "Content-Type": "application/json", ...options.headers },
     body: JSON.stringify({
-      model: "claude-sonnet-4-5",
+      model: options.model ?? "claude-sonnet-4-5",
       max_tokens: 128,
       stream: options.stream,
       messages,
@@ -327,6 +436,26 @@ async function post(app: TestApp, headers: Record<string, string> = {}, content:
 
 async function postStream(app: TestApp, options: Omit<PostMessagesOptions, "stream">): Promise<Response> {
   return postMessages(app, { ...options, stream: true })
+}
+
+async function postClaudeCode(app: TestApp, sessionId: string, content: string, agentId?: string): Promise<number> {
+  const response = await app.fetch(new Request("http://localhost/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "user-agent": "claude-cli/2.1.287",
+      ...(agentId ? { "x-claude-code-agent-id": agentId } : {}),
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-5",
+      max_tokens: 128,
+      stream: false,
+      messages: [{ role: "user", content }],
+      metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+    }),
+  }))
+  await response.text()
+  return response.status
 }
 
 const OPENING_MESSAGE = "shared opening"
@@ -388,6 +517,13 @@ let savedPriorityFailbackSetting: PriorityFailbackPolicy | undefined
 beforeEach(() => {
   failureMessage = DEFAULT_FAILURE
   failAfterContentDirs = new Set()
+  failingModelDirs = new Map()
+  preludePingDirs = new Set()
+  preludePingSucceedDirs = new Set()
+  preludeHeartbeatDirs = new Map()
+  silentForeverDirs = new Set()
+  signalAccountPending = () => {}
+  delayedRefusals = 0
   exposureBeforeFailureDirs = new Map()
   noncanonicalToolFailureDirs = new Set()
   promotionConcurrencyGate = null
@@ -408,14 +544,14 @@ afterEach(() => {
 })
 
 describe("priority routing", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     resetProcessSdkSemaphoreForTests()
     capturedEnvs = []
     failingDirs = new Set()
     // failureMessage resets in the file-level beforeEach, which runs first and
     // covers the later describes too — this one only ever saw the leak because
     // its own tests happened to run last.
-    clearSessionCache()
+    await clearSessionCache()
     // The active profile is process-global module state; other test files
     // (profile-switch integration) set it. This suite's expectations are
     // relative to defaultProfile, so reset it explicitly.
@@ -453,6 +589,7 @@ describe("priority routing", () => {
     const app = createTestApp()
     const res = await post(app, {}, "priority routes preferred unique message")
     expect(res.status).toBe(200)
+    expect(res.headers.get("x-claude-session-id")).not.toBeNull()
     expect(capturedEnvs).toHaveLength(1)
     expect(capturedEnvs[0]).toContain("prof-work")
   })
@@ -549,6 +686,163 @@ describe("priority routing", () => {
     expect(capturedEnvs[0]).toContain("prof-work")
   })
 
+  describe("profiles signed in to one account", () => {
+    // work and twin hold ONE account (same account and organization UUIDs);
+    // personal is the same person in another organization, its own quota.
+    const sameAccount = { name: "Acme", accountUuid: "acct-1", organizationUuid: "org-1", email: null }
+    let tempDir = ""
+    let savedOrganizations: string | null = null
+    let storeOverride: ReturnType<typeof spyOn>
+    const tokenMarks: Record<string, number> = {}
+
+    function organizationsFile(): string {
+      return join(process.env.MERIDIAN_CONFIG_DIR!, "organizations.json")
+    }
+
+    function createTwinApp(): TestApp {
+      const { app } = createProxyServer({
+        port: 0,
+        host: "127.0.0.1",
+        profiles: ["work", "twin", "personal"].map(id => ({
+          id,
+          claudeConfigDir: join(tempDir, id === "twin" ? "twin-of-w" : `prof-${id}`),
+        })),
+        defaultProfile: "work",
+      })
+      return app
+    }
+
+    beforeEach(async () => {
+      tempDir = mkdtempSync(join(tmpdir(), "meridian-shared-quota-"))
+      savedOrganizations = existsSync(organizationsFile()) ? readFileSync(organizationsFile(), "utf-8") : null
+      const tokens = await import("../proxy/tokenRefresh")
+      tokens.setCredentialStorePlatformForTests("linux")
+      storeOverride = spyOn(tokens, "createPlatformCredentialStore").mockImplementation(options =>
+        createOwnedCredentialStore(tempDir, options?.claudeConfigDir ?? join(tempDir, "prof-default")))
+      // Each profile's stored token, far from expiry so nothing refreshes it.
+      const base = Date.now() + 6 * 3_600_000
+      for (const [index, dir] of ["prof-work", "twin-of-w", "prof-personal"].entries()) {
+        const expiresAt = base + index * 1_000
+        tokenMarks[dir] = expiresAt
+        mkdirSync(join(tempDir, dir), { recursive: true })
+        writeFileSync(join(tempDir, dir, ".credentials.json"), JSON.stringify({
+          claudeAiOauth: { accessToken: `fake-${dir}`, refreshToken: "fake-refresh", expiresAt, subscriptionType: "max" },
+        }))
+      }
+      rememberOrganization("work", sameAccount, tokenMarks["prof-work"]!)
+      rememberOrganization("twin", sameAccount, tokenMarks["twin-of-w"]!)
+      rememberOrganization("personal", { ...sameAccount, organizationUuid: "org-personal" }, tokenMarks["prof-personal"]!)
+      process.env.MERIDIAN_PROFILE_ORDER = "work,twin,personal"
+      failingDirs.add("prof-work")
+    })
+
+    afterEach(async () => {
+      storeOverride.mockRestore()
+      const tokens = await import("../proxy/tokenRefresh")
+      tokens.setCredentialStorePlatformForTests(null)
+      if (savedOrganizations === null) rmSync(organizationsFile(), { force: true })
+      else writeFileSync(organizationsFile(), savedOrganizations)
+      rmSync(tempDir, { recursive: true, force: true })
+    })
+
+    it("a quota refusal cools down every profile signed in to the same account", async () => {
+      const app = createTwinApp()
+      const res = await post(app, {}, "shared quota unique message")
+      expect(res.status).toBe(200)
+      expect(capturedEnvs[capturedEnvs.length - 1]).toContain("prof-personal")
+      // The twin is never asked: its answer is the refusal work just gave.
+      expect(capturedEnvs.some((e) => e.includes("twin-of-w"))).toBe(false)
+      expect((await exhaustedMarks(app)).map(mark => mark.id).sort()).toEqual(["twin", "work"])
+    }, 20_000)
+
+    it("a streamed quota refusal skips the twin too", async () => {
+      const app = createTwinApp()
+      const res = await postMessages(app, { stream: true, content: "shared quota streamed unique message" })
+      expect(res.status).toBe(200)
+      expect(await res.text()).toContain("prof-personal")
+      expect(capturedEnvs.some((e) => e.includes("twin-of-w"))).toBe(false)
+      expect((await exhaustedMarks(app)).map(mark => mark.id).sort()).toEqual(["twin", "work"])
+    }, 20_000)
+
+    it("a twin whose stored token now belongs to another account is not cooled down", async () => {
+      // twin was signed in to another account with `claude login`: its stored
+      // token changed, and its saved record, read for the earlier token, still
+      // names work's account.
+      rememberOrganization("twin", sameAccount, tokenMarks["twin-of-w"]! - 60_000)
+      const app = createTwinApp()
+      const res = await post(app, {}, "relogged twin unique message")
+      expect(res.status).toBe(200)
+      expect(capturedEnvs[capturedEnvs.length - 1]).toContain("twin-of-w")
+      expect((await exhaustedMarks(app)).map(mark => mark.id)).toEqual(["work"])
+    }, 20_000)
+
+    it("cools down no twin when the refused profile's own record predates its token", async () => {
+      // Nothing proves which account refused, so nothing else is benched.
+      rememberOrganization("work", sameAccount, tokenMarks["prof-work"]! - 60_000)
+      const app = createTwinApp()
+      const res = await post(app, {}, "stale refuser unique message")
+      expect(res.status).toBe(200)
+      expect(capturedEnvs[capturedEnvs.length - 1]).toContain("twin-of-w")
+      expect((await exhaustedMarks(app)).map(mark => mark.id)).toEqual(["work"])
+    }, 20_000)
+
+    it("the OAuth refinement extends the twin's cooldown too", async () => {
+      const WORK_RESET = Date.now() + 4 * 60 * 60_000
+      __setFetchOAuthUsageOverride(async (opts) => {
+        if (opts?.profileId !== "work") return null
+        return { windows: [{ type: "five_hour", utilization: 1, resetsAt: WORK_RESET }], extraUsage: null, bankedResets: null, fetchedAt: Date.now() }
+      })
+      const app = createTwinApp()
+      await post(app, {}, "refined twin unique message")
+      await Bun.sleep(50)
+      const marks = await exhaustedMarks(app)
+      expect(marks.map(m => [m.id, m.until]).sort()).toEqual([["twin", WORK_RESET], ["work", WORK_RESET]])
+    }, 20_000)
+
+    it("a per-model weekly refusal benches the twin for that model only", async () => {
+      failingDirs.delete("prof-work")
+      failingModelDirs.set("prof-work", "fable")
+      failureMessage = "Claude Code returned an error result: You've hit your Fable limit"
+      const app = createTwinApp()
+      const res = await postMessages(app, { model: "claude-fable-5-2", content: "fable twin unique message", stream: false })
+      expect(res.status).toBe(200)
+      expect(await res.text()).toContain("prof-personal")
+      expect(capturedEnvs.some((e) => e.includes("twin-of-w"))).toBe(false)
+      const health = await (await app.fetch(new Request("http://localhost/profiles/health"))).json() as {
+        exhausted: unknown[]
+        exhaustedModels: Array<{ id: string; modelFamily: string }>
+      }
+      expect(health.exhausted).toEqual([])
+      expect(health.exhaustedModels.map(m => [m.id, m.modelFamily]).sort()).toEqual([["twin", "fable"], ["work", "fable"]])
+      capturedEnvs = []
+      const other = await postMessages(app, { model: "claude-opus-4-1", content: "opus after fable twin unique message", stream: false })
+      expect(other.status).toBe(200)
+      await other.text()
+      expect(capturedEnvs).toHaveLength(1)
+      expect(capturedEnvs[0]).toContain("prof-work")
+    }, 20_000)
+
+    it("a twin whose token renewed since its account was read is still tried", async () => {
+      // Same account, but the twin's access token was renewed after its record
+      // was read and no /profiles/list poll has re-read it yet (headless use).
+      rememberOrganization("twin", sameAccount, tokenMarks["twin-of-w"]! - 8 * 3_600_000)
+      failingDirs.add("twin-of-w")
+      const app = createTwinApp()
+      const res = await post(app, {}, "renewed twin unique message")
+      expect(res.status).toBe(200)
+      expect(capturedEnvs.some((e) => e.includes("twin-of-w"))).toBe(true)
+    }, 20_000)
+
+    it("a billing refusal benches only the refused profile", async () => {
+      failureMessage = SUBSCRIPTION_REFUSAL
+      const app = createTwinApp()
+      const res = await post(app, {}, "billing twin unique message")
+      expect(res.status).toBe(200)
+      expect(capturedEnvs[capturedEnvs.length - 1]).toContain("twin-of-w")
+      expect((await exhaustedMarks(app)).map(mark => mark.id)).toEqual(["work"])
+    }, 20_000)
+  })
+
   it("surfaces the LAST tried profile's error when every profile is exhausted", async () => {
     failingDirs.add("prof-work")
     failingDirs.add("prof-personal")
@@ -584,6 +878,24 @@ describe("priority routing", () => {
     // NEW session ALSO goes to personal for now — exhaustion outlives one
     // success elsewhere. This asserts the assignment layer specifically.
   }, 20_000)
+
+  it("keeps a Claude Code subagent on its conversation's assigned account", async () => {
+    const app = createTestApp()
+    const sessionId = `cc-priority-${crypto.randomUUID()}`
+    // The conversation is assigned to personal while personal is preferred.
+    process.env.MERIDIAN_PROFILE_ORDER = "personal,work"
+    expect(await postClaudeCode(app, sessionId, "cc opening")).toBe(200)
+    expect(capturedEnvs.at(-1)).toContain("prof-personal")
+    process.env.MERIDIAN_PROFILE_ORDER = "work,personal"
+    capturedEnvs = []
+
+    // A brand-new conversation drains back to the preferred account...
+    expect(await postClaudeCode(app, `cc-priority-new-${crypto.randomUUID()}`, "cc unrelated")).toBe(200)
+    expect(capturedEnvs.at(-1)).toContain("prof-work")
+    // ...while a subagent of the assigned conversation stays with it.
+    expect(await postClaudeCode(app, sessionId, "cc subagent task", "a4a81dc1bbf7ee837")).toBe(200)
+    expect(capturedEnvs.at(-1)).toContain("prof-personal")
+  })
 
   it("defaults an unset priority failback policy to new-conversation affinity", async () => {
     // Given
@@ -733,6 +1045,98 @@ describe("priority routing", () => {
 
     // Then
     expect(body).toContain("prof-personal")
+    expect(capturedEnvs.every(dir => dir.includes("prof-personal"))).toBe(true)
+  })
+
+  it("promotes a Pi conversation on a newer human turn signed by the Pi extension", async () => {
+    // Given
+    process.env.MERIDIAN_PRIORITY_FAILBACK = "next-user-turn"
+    const app = createTestApp()
+    await assignPiToFallback(app, "pi-promotion-session")
+
+    // When
+    const response = await post(app, trustedPiTurnHeaders("pi-promotion-session", "e5f6a7b8"), CONTINUED_AFTER_PERSONAL)
+    const body = await response.text()
+
+    // Then
+    expect(body).toContain("prof-work")
+    expect(capturedEnvs[0]).toContain("prof-work")
+    expect(lookupPriorityAssignmentResult("pi:pi-promotion-session").status).toBe("found")
+  })
+
+  it("keeps a Pi tool continuation of the same human turn on its fallback", async () => {
+    // Given
+    process.env.MERIDIAN_PRIORITY_FAILBACK = "next-user-turn"
+    const app = createTestApp()
+    await assignPiToFallback(app, "pi-tool-session")
+
+    // When
+    const response = await post(app, trustedPiTurnHeaders("pi-tool-session", "a1b2c3d4"), TOOL_CONTINUATION)
+    const body = await response.text()
+
+    // Then
+    expect(body).toContain("prof-personal")
+    expect(capturedEnvs.every(dir => dir.includes("prof-personal"))).toBe(true)
+  })
+
+  it("never promotes a Pi request marked as a side call or subagent", async () => {
+    // Given
+    process.env.MERIDIAN_PRIORITY_FAILBACK = "next-user-turn"
+    const app = createTestApp()
+    await assignPiToFallback(app, "pi-source-session")
+
+    for (const source of ["fork-side-call", "subagent-child"]) {
+      const headers = {
+        ...trustedPiTurnHeaders("pi-source-session", "e5f6a7b8"),
+        "x-meridian-source": source,
+      }
+
+      // When
+      const response = await post(app, headers, CONTINUED_AFTER_PERSONAL)
+      const body = await response.text()
+
+      // Then
+      expect(body).toContain("prof-personal")
+      expect(capturedEnvs.every(dir => dir.includes("prof-personal"))).toBe(true)
+    }
+  })
+
+  it("does not accept a Pi attestation for an OpenCode session, or the reverse", async () => {
+    // Given
+    process.env.MERIDIAN_PRIORITY_FAILBACK = "next-user-turn"
+    const app = createTestApp()
+    await assignToFallback(app, "cross-opencode-session")
+    await assignPiToFallback(app, "cross-pi-session")
+    // Everything but the generation matches what each adapter would accept.
+    const issuedAt = Math.floor(Date.now() / 1000) + 5
+    const piTokenForOpenCode = createPriorityAttestation({
+      generation: "pi1",
+      sessionId: "cross-opencode-session",
+      agentId: "build",
+      humanMessageId: "request-2",
+      issuedAt,
+    }, PRIORITY_ATTESTATION_TEST_KEY)!
+    const openCodeTokenForPi = createPriorityAttestation({
+      generation: "oc1",
+      sessionId: "cross-pi-session",
+      agentId: "pi",
+      humanMessageId: "e5f6a7b8",
+      issuedAt,
+    }, PRIORITY_ATTESTATION_TEST_KEY)!
+
+    // When
+    const openCode = await post(app, {
+      ...trustedOpenCodeTurnHeaders("cross-opencode-session", "request-2"),
+      "x-meridian-opencode-turn": piTokenForOpenCode,
+    }, CONTINUED_AFTER_PERSONAL)
+    const pi = await post(app, {
+      ...trustedPiTurnHeaders("cross-pi-session", "e5f6a7b8"),
+      "x-meridian-opencode-turn": openCodeTokenForPi,
+    }, CONTINUED_AFTER_PERSONAL)
+
+    // Then
+    expect(await openCode.text()).toContain("prof-personal")
+    expect(await pi.text()).toContain("prof-personal")
     expect(capturedEnvs.every(dir => dir.includes("prof-personal"))).toBe(true)
   })
 
@@ -1149,7 +1553,7 @@ describe("priority routing", () => {
     const firstApp = createTestApp()
     await assignToFallback(firstApp, sessionId, "human-1")
     const staleRoute = durableRoute(sessionId)
-    expect(evictSharedSession(staleRoute.mappingKey, staleRoute.mappingGeneration)).toBe(true)
+    expect(await evictSharedSession(staleRoute.mappingKey, staleRoute.mappingGeneration)).toBe(true)
     expect(lookupSharedSessionResult(staleRoute.mappingKey).status).toBe("missing")
     capturedEnvs = []
     capturedSdkCalls = []
@@ -1219,6 +1623,12 @@ describe("priority routing", () => {
         expect(response.status).toBe(stream ? 200 : 402)
         expect(body).toContain("billing_error")
         expect(body).toContain("subscription")
+        if (stream) {
+          // The withheld attempt's own error frame relays verbatim — never a
+          // substituted api_error envelope (that substitution is how a
+          // locked-body copy bug would show up here).
+          expect(body).not.toContain("api_error")
+        }
         expect(capturedEnvs).toHaveLength(1)
         expect(capturedSdkCalls).toHaveLength(1)
         expect(capturedEnvs[0]).toContain("prof-work")
@@ -1438,8 +1848,9 @@ describe("priority routing", () => {
 
     await body.cancel("cancel after atomic publication")
     recoveryGate.open()
-    for (let attempt = 0; attempt < 50 && durableRoute(sessionId).profileId !== "personal"; attempt++) {
-      await new Promise<void>(resolve => setImmediate(resolve))
+    // The rollback is a store write off the event loop; give it wall time, not ticks.
+    for (let attempt = 0; attempt < 500 && durableRoute(sessionId).profileId !== "personal"; attempt++) {
+      await new Promise<void>(resolve => setTimeout(resolve, 10))
     }
 
     const restored = durableRoute(sessionId)
@@ -1482,7 +1893,7 @@ describe("priority routing", () => {
     await body.cancel("cancel unsigned publication before terminal")
     latePublicationRecoveryGate = null
     recoveryGate.open()
-    for (let attempt = 0; attempt < 100; attempt++) {
+    for (let attempt = 0; attempt < 500; attempt++) {
       const current = durableRoute(sessionId)
       const mapping = lookupSharedSessionResult(current.mappingKey)
       if (
@@ -1490,7 +1901,7 @@ describe("priority routing", () => {
         && mapping.session.claudeSessionId === fallbackMapping.session.claudeSessionId
         && current.mappingGeneration === mapping.generation
       ) break
-      await new Promise<void>(resolve => setImmediate(resolve))
+      await new Promise<void>(resolve => setTimeout(resolve, 10))
     }
     const restored = durableRoute(sessionId)
     const restoredMapping = lookupSharedSessionResult(restored.mappingKey)
@@ -1666,6 +2077,250 @@ describe("priority routing", () => {
     expect(text.split("event: message_start").length - 1).toBe(1)
   }, 20_000)
 
+  it("keeps a pre-stream refusal's own HTTP status on a streaming request", async () => {
+    const gate = createStreamCompletionGate(++capturePhase)
+    streamCompletionGate = gate
+    const app = createTestApp()
+    const headers = { "x-opencode-session": "stream-conflict-session" }
+    const first = await postStream(app, { headers, content: "same request" })
+    await gate.entered
+    const second = postStream(app, { headers, content: "same request" })
+    await Bun.sleep(10)
+    gate.open()
+    await first.text()
+    const refused = await second
+    expect(refused.status).toBe(400)
+    expect(refused.headers.get("content-type")).toContain("application/json")
+    const body = await refused.json() as { error: { type: string } }
+    expect(body.error.type).toBe("invalid_request_error")
+  }, 20_000)
+
+  it("lets a compat route relay a pre-stream refusal with its status", async () => {
+    const gate = createStreamCompletionGate(++capturePhase)
+    streamCompletionGate = gate
+    const app = createTestApp()
+    const completion = () => app.fetch(new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-opencode-session": "compat-conflict-session" },
+      body: JSON.stringify({ model: "claude-sonnet-4-5", stream: true, messages: [{ role: "user", content: "same request" }] }),
+    }))
+    const first = await completion()
+    await gate.entered
+    const second = completion()
+    await Bun.sleep(10)
+    gate.open()
+    await first.text()
+    expect((await second).status).toBe(400)
+  }, 20_000)
+
+  const STREAM_BODY = JSON.stringify({
+    model: "claude-sonnet-4-5",
+    max_tokens: 128,
+    stream: true,
+    messages: [{ role: "user", content: "hello" }],
+  })
+
+  it("streams fail over when a keepalive ping precedes the account error", async () => {
+    // A ping frame carries no content, so the quota refusal behind it must
+    // still reach the sniffer and fail over.
+    preludePingDirs.add("prof-work")
+    const app = createTestApp()
+    const res = await app.fetch(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: STREAM_BODY,
+    }))
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain("prof-personal")
+    expect(text.split("event: message_start").length - 1).toBe(1)
+    expect(text).not.toContain("rate_limit_error")
+  }, 20_000)
+
+  it("discards SDK transport pings without suppressing successful content", async () => {
+    // SDK pings do not represent model progress. Raw downstream SSE keepalives
+    // remain covered by the relay/framing tests and the delayed socket case.
+    preludePingSucceedDirs.add("prof-work")
+    const app = createTestApp()
+    const res = await app.fetch(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: STREAM_BODY,
+    }))
+    expect(res.status).toBe(200)
+    // Streaming already omits speculative SDK IDs: do not invent one on the
+    // outer response while account selection is still pending.
+    expect(res.headers.get("x-claude-session-id")).toBeNull()
+    const text = await res.text()
+    expect(text).not.toContain("event: ping")
+    expect(text).toContain("event: message_start")
+    expect(text).toContain("ok from /tmp/meridian-test-prof-work")
+    expect(text.split("event: message_start").length - 1).toBe(1)
+  }, 20_000)
+
+  it("streams fail over when the service heartbeat precedes the account error", async () => {
+    // The proxy heartbeats `: ping`
+    // every 15s while the spent account is still deciding, and the refusal
+    // arrives AFTER that comment. Shipped behavior answered the client with
+    // the error and never tried the healthy account. The billing refusal
+    // keeps the work account to a single attempt — a quota refusal here
+    // would re-enter the in-stream retry ladder and re-sleep per attempt
+    // (rate_limit_error behind a keepalive is covered by the ping test and
+    // the scanner unit tests). The account decision runs inside the
+    // client-facing stream, so the heartbeat itself is now observable on the
+    // wire instead of buffered by a pending verdict.
+    failureMessage = SUBSCRIPTION_REFUSAL
+    preludeHeartbeatDirs.set("prof-work", 16_000)
+    const app = createTestApp()
+    const res = await app.fetch(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: STREAM_BODY,
+    }))
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain(": ping")
+    expect(text).toContain("prof-personal")
+    expect(text.split("event: message_start").length - 1).toBe(1)
+    expect(text).not.toContain("billing_error")
+  }, 35_000)
+
+  it("delivers headers and the first keepalive before a delayed refusal, then fails over exactly once", async () => {
+    // Exercise response-header and heartbeat delivery on a real socket.
+    // The account decision runs INSIDE the client-facing stream: response
+    // headers and the downstream heartbeat reach the client while the spent
+    // account is still deciding — never held until the verdict — and the
+    // healthy fallback then serves exactly once.
+    failureMessage = SUBSCRIPTION_REFUSAL
+    preludeHeartbeatDirs.set("prof-work", 16_000)
+    const app = createTestApp()
+    const server = createAdaptorServer({ fetch: app.fetch })
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve))
+    try {
+      const { port } = server.address() as AddressInfo
+      const accountPending = new Promise<void>(resolve => { signalAccountPending = resolve })
+      const pending = fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: STREAM_BODY,
+      })
+      await accountPending
+      const first = await Promise.race([
+        pending.then(() => "headers" as const),
+        new Promise<"deadline">(resolve => setTimeout(() => resolve("deadline"), 100)),
+      ])
+      // The withheld-headers regression: a pending account verdict must not
+      // hold the client's response headers.
+      expect(first).toBe("headers")
+      expect(delayedRefusals).toBe(0)
+      const res = await pending
+      expect(res.status).toBe(200)
+      const reader = res.body!.getReader()
+      const decoder = new TextDecoder()
+      // The FIRST wire bytes are the content-free keepalive, not a decision.
+      const firstChunk = await reader.read()
+      const firstText = decoder.decode(firstChunk.value)
+      expect(firstText).toContain(": ping\n\n")
+      expect(delayedRefusals).toBe(0)
+      let body = firstText
+      while (true) {
+        const next = await reader.read()
+        if (next.done) break
+        body += decoder.decode(next.value)
+      }
+      expect(body).toContain("prof-personal")
+      expect(body.split("event: message_start").length - 1).toBe(1)
+      expect(body).not.toContain("billing_error")
+      expect(capturedEnvs.filter(e => e.includes("prof-personal"))).toHaveLength(1)
+      expect(delayedRefusals).toBe(1)
+    } finally {
+      ;(server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.()
+      server.close()
+    }
+  }, 35_000)
+
+  it("cancelling before the inner response exists never starts SDK work", async () => {
+    silentForeverDirs.add("prof-work")
+    const app = createTestApp()
+    const res = await postStream(app, {})
+    await res.body!.cancel("cancel before reader registration")
+    await new Promise(resolve => setTimeout(resolve, 300))
+    expect(capturedEnvs).toHaveLength(0)
+  }, 5_000)
+
+  it("releases the exact durable turn claim after pre-response cancellation", async () => {
+    const app = createTestApp()
+    const sessionId = "pre-response-cancel-claim"
+    await assignToFallback(app, sessionId)
+    const headers = trustedOpenCodeTurnHeaders(sessionId, "cancelled-turn")
+    capturedEnvs = []
+    const res = await postStream(app, { headers, content: CONTINUED_AFTER_PERSONAL })
+    await res.body!.cancel("cancel pending preparation")
+    await new Promise(resolve => setTimeout(resolve, 300))
+    expect(capturedEnvs).toHaveLength(0)
+    const retried = await postStream(app, { headers, content: CONTINUED_AFTER_PERSONAL })
+    const text = await retried.text()
+    expect(text).not.toContain("Durable priority attempt state is unavailable")
+    expect(text).toContain("message_start")
+  }, 10_000)
+
+  it("releases the exact durable turn claim after the entire stream pool refuses", async () => {
+    const app = createTestApp()
+    const sessionId = "refused-pool-claim"
+    await assignToFallback(app, sessionId)
+    const headers = trustedOpenCodeTurnHeaders(sessionId, "refused-turn")
+    failureMessage = SUBSCRIPTION_REFUSAL
+    failingDirs.add("prof-work")
+    failingDirs.add("prof-personal")
+    const refused = await postStream(app, { headers, content: CONTINUED_AFTER_PERSONAL })
+    expect((await refused.text()).split("event: error").length - 1).toBe(1)
+    failingDirs.clear()
+    // A new instance has a fresh process-local exhaustion map, but shares the
+    // durable claim table. Retry the exact same authenticated logical turn.
+    const retried = await postStream(createTestApp(), { headers, content: CONTINUED_AFTER_PERSONAL })
+    const text = await retried.text()
+    expect(text).not.toContain("Durable priority attempt state is unavailable")
+    expect(text).toContain("message_start")
+  }, 15_000)
+
+  it("cancelling a keepalive-only pending stream stops promptly without a fallback", async () => {
+    silentForeverDirs.add("prof-work")
+    const app = createTestApp()
+    const pending = postStream(app, {})
+    const res = await pending
+    expect(res.status).toBe(200)
+    const reader = res.body!.getReader()
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain(": ping\n\n")
+    expect(activeSilentCalls).toBe(1)
+    // Cancel after a real keepalive, but before meaningful output.
+    await reader.cancel()
+    await new Promise(resolve => setTimeout(resolve, 300))
+    expect(activeSilentCalls).toBe(0)
+    expect(capturedEnvs.some(e => e.includes("prof-personal"))).toBe(false)
+    // A cancelled stream must not wedge the dispatcher: a fresh request
+    // still answers from the pool.
+    silentForeverDirs.clear()
+    const fresh = await postStream(app, { content: "post-cancel unique message" })
+    expect(fresh.status).toBe(200)
+    expect(await fresh.text()).toContain("message_start")
+  }, 25_000)
+
+  it("emits the pool's terminal error exactly once once headers are out", async () => {
+    failureMessage = SUBSCRIPTION_REFUSAL
+    failingDirs.add("prof-work")
+    failingDirs.add("prof-personal")
+    const app = createTestApp()
+    const res = await postStream(app, {})
+    // Headers go out before any verdict, so the pool's terminal refusal can
+    // only travel inside the stream — one coherent error frame, not one per
+    // refused account.
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text.split("event: error").length - 1).toBe(1)
+    expect(text).toContain("billing_error")
+    expect(text).not.toContain("message_start")
+  }, 20_000)
+
   it("surfaces the refusal's own status when every account is refused", async () => {
     failureMessage = SUBSCRIPTION_REFUSAL
     failingDirs.add("prof-work")
@@ -1780,10 +2435,10 @@ describe("priority cooldown resolution", () => {
   const WORK_RESET = Date.now() + 4 * 60 * 60_000      // 4h out
   const PERSONAL_RESET = Date.now() + 30 * 60_000      // 30m out
 
-  beforeEach(() => {
+  beforeEach(async () => {
     capturedEnvs = []
     failingDirs = new Set()
-    clearSessionCache()
+    await clearSessionCache()
     resetActiveProfile()
     savedEnv.MERIDIAN_ROUTING = process.env.MERIDIAN_ROUTING
     savedEnv.MERIDIAN_PROFILE_ORDER = process.env.MERIDIAN_PROFILE_ORDER
@@ -1936,7 +2591,7 @@ describe("priority cooldown resolution", () => {
   it("refines a default-length mark with the authoritative OAuth reset", async () => {
     __setFetchOAuthUsageOverride(async (opts) => {
       if (opts?.profileId !== "work") return null
-      return { windows: [{ type: "five_hour", utilization: 1, resetsAt: WORK_RESET }], extraUsage: null, fetchedAt: Date.now() }
+      return { windows: [{ type: "five_hour", utilization: 1, resetsAt: WORK_RESET }], extraUsage: null, bankedResets: null, fetchedAt: Date.now() }
     })
     failingDirs.add("prof-work")
     const app = createTestApp()
@@ -1989,7 +2644,7 @@ describe("priority cooldown resolution", () => {
     __setFetchOAuthUsageOverride(async (opts) => {
       attempted.push(opts?.profileId)
       if (opts?.profileId !== "work") return null
-      return { windows: [{ type: "five_hour", utilization: 1, resetsAt: WORK_RESET }], extraUsage: null, fetchedAt: Date.now() }
+      return { windows: [{ type: "five_hour", utilization: 1, resetsAt: WORK_RESET }], extraUsage: null, bankedResets: null, fetchedAt: Date.now() }
     })
     failingDirs.add("prof-work")
     const app = createTestApp()
@@ -2010,6 +2665,7 @@ describe("priority cooldown resolution", () => {
     __setFetchOAuthUsageOverride(async () => ({
       windows: [{ type: "five_hour", utilization: 1, resetsAt: PERSONAL_RESET }],
       extraUsage: null,
+      bankedResets: null,
       fetchedAt: Date.now(),
     }))
     failingDirs.add("prof-work")
@@ -2062,7 +2718,7 @@ describe("priority cooldown resolution", () => {
     const futureReset = Date.now() + 3 * 60 * 60_000 // comfortably in the future, well under the 6h cap
     __setFetchOAuthUsageOverride(async (opts) => {
       if (opts?.profileId !== "work") return null
-      return { windows: [{ type: "five_hour", utilization: 0.2, resetsAt: futureReset }], extraUsage: null, fetchedAt: Date.now() }
+      return { windows: [{ type: "five_hour", utilization: 0.2, resetsAt: futureReset }], extraUsage: null, bankedResets: null, fetchedAt: Date.now() }
     })
     failingDirs.add("prof-work")
     const app = createTestApp()
@@ -2101,7 +2757,7 @@ describe("priority cooldown resolution", () => {
     const farReset = Date.now() + 12 * 60 * 60_000 // 12h out — beyond the 6h cap
     __setFetchOAuthUsageOverride(async (opts) => {
       if (opts?.profileId !== "work") return null
-      return { windows: [{ type: "five_hour", utilization: 1, resetsAt: farReset }], extraUsage: null, fetchedAt: Date.now() }
+      return { windows: [{ type: "five_hour", utilization: 1, resetsAt: farReset }], extraUsage: null, bankedResets: null, fetchedAt: Date.now() }
     })
     failingDirs.add("prof-work")
     const app = createTestApp()
@@ -2130,11 +2786,234 @@ describe("priority cooldown resolution", () => {
   }, 20_000)
 })
 
-describe("keyless priority affinity", () => {
-  beforeEach(() => {
+describe("per-model weekly bench", () => {
+  const DAY_MS = 24 * 60 * 60_000
+  const FABLE_LIMIT = "Claude Code returned an error result: You've hit your Fable limit"
+
+  type Health = {
+    exhausted: Array<{ id: string; until: number; reason: string }>
+    exhaustedModels: Array<{ id: string; modelFamily: string; until: number; reason: string }>
+    spent: Array<{ profileId: string; diagnosis: { bucket: string | null; reported: boolean; source: string }; modelFamily: string | null }>
+  }
+
+  type QuotaSpent = { diagnosis: { bucket: string | null; reported: boolean }; modelFamily: string | null } | null
+
+  /** One profile's `spent` as `/v1/usage/quota/all` reports it. */
+  async function quotaSpent(app: TestApp, id: string): Promise<QuotaSpent> {
+    const body = await (await app.fetch(new Request("http://localhost/v1/usage/quota/all"))).json() as {
+      profiles: Array<{ id: string; spent: QuotaSpent }>
+    }
+    return body.profiles.find(profile => profile.id === id)?.spent ?? null
+  }
+
+  async function health(app: TestApp): Promise<Health> {
+    return await (await app.fetch(new Request("http://localhost/profiles/health"))).json() as Health
+  }
+
+  /** The profiles one request tried, in order. */
+  async function attempts(app: TestApp, model: string, content: string, stream = false): Promise<string[]> {
+    capturedEnvs = []
+    const res = await postMessages(app, { model, content, stream })
+    expect(res.status).toBe(200)
+    await res.text()
+    return capturedEnvs.map(dir => dir.includes("prof-work") ? "work" : dir.includes("prof-personal") ? "personal" : dir)
+  }
+
+  beforeEach(async () => {
+    resetProcessSdkSemaphoreForTests()
     capturedEnvs = []
     failingDirs = new Set()
-    clearSessionCache()
+    await clearSessionCache()
+    resetActiveProfile()
+    savedEnv.MERIDIAN_ROUTING = process.env.MERIDIAN_ROUTING
+    savedEnv.MERIDIAN_PROFILE_ORDER = process.env.MERIDIAN_PROFILE_ORDER
+    savedEnv.MERIDIAN_PRIORITY_FAILBACK = process.env.MERIDIAN_PRIORITY_FAILBACK
+    savedEnv.CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR
+    delete process.env.CLAUDE_CONFIG_DIR
+    process.env.MERIDIAN_ROUTING = "priority"
+    process.env.MERIDIAN_PROFILE_ORDER = "work,personal"
+    delete process.env.MERIDIAN_PRIORITY_FAILBACK
+    rateLimitStore.clear()
+    resetOAuthUsageCache()
+  })
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+    rateLimitStore.clear()
+    resetOAuthUsageCache()
+  })
+
+  it("benches a profile only for the refused model, until that model's bucket resets", async () => {
+    const opusReset = Date.now() + 3 * DAY_MS
+    rateLimitStore.record("work", { status: "rejected", rateLimitType: "seven_day_opus", utilization: 1, resetsAt: opusReset })
+    failingModelDirs.set("prof-work", "opus")
+    const app = createTestApp()
+
+    const first = await attempts(app, "claude-opus-4-1", "opus refused on work")
+    expect(first[0]).toBe("work")
+    expect(first.at(-1)).toBe("personal")
+    const after = await health(app)
+    expect(after.exhausted).toEqual([])
+    expect(after.exhaustedModels).toEqual([{ id: "work", modelFamily: "opus", until: opusReset, reason: "rate_limit_error" }])
+    expect(after.spent.map(entry => entry.diagnosis)).toEqual([expect.objectContaining({ bucket: "seven_day_opus", reported: true, source: "sdk_event" })])
+
+    // Other models keep using the profile; the refused one skips it without a re-probe.
+    expect(await attempts(app, "claude-sonnet-4-5", "sonnet after the opus refusal")).toEqual(["work"])
+    expect(await attempts(app, "claude-fable-5-2", "fable after the opus refusal")).toEqual(["work"])
+    expect(await attempts(app, "claude-opus-4-1", "opus after the opus refusal")).toEqual(["personal"])
+  }, 20_000)
+
+  it("keeps routing other models to a Fable-refused profile and learns the Fable bucket's reset", async () => {
+    const fableReset = Date.now() + 5 * DAY_MS
+    __setFetchOAuthUsageOverride(async (opts) => opts?.profileId === "work"
+      ? {
+          windows: [
+            { type: "five_hour", utilization: 0.2, resetsAt: Date.now() + 60 * 60_000 },
+            { type: "seven_day", utilization: 0.4, resetsAt: Date.now() + 6 * DAY_MS },
+            { type: "seven_day_fable", utilization: 1, resetsAt: fableReset },
+          ],
+          extraUsage: null,
+          bankedResets: null,
+          fetchedAt: Date.now(),
+        }
+      : null)
+    failureMessage = FABLE_LIMIT
+    failingModelDirs.set("prof-work", "fable")
+    const app = createTestApp()
+
+    const first = await attempts(app, "claude-fable-5-2", "fable refused on work")
+    expect(first[0]).toBe("work")
+    expect(first.at(-1)).toBe("personal")
+    // The refinement is deliberately not awaited by the request path.
+    await Bun.sleep(20)
+    const after = await health(app)
+    expect(after.exhausted).toEqual([])
+    expect(after.exhaustedModels).toEqual([{ id: "work", modelFamily: "fable", until: fableReset, reason: "rate_limit_error" }])
+    // What a client reads to tell a Fable-only refusal apart.
+    expect(after.spent.map(entry => entry.diagnosis)).toEqual([expect.objectContaining({ bucket: "seven_day_fable", reported: true, source: "error_message" })])
+    expect(await quotaSpent(app, "work")).toMatchObject({ diagnosis: { bucket: "seven_day_fable", reported: true }, modelFamily: "fable" })
+
+    expect(await attempts(app, "claude-opus-4-1", "opus after the fable refusal")).toEqual(["work"])
+    // Mythos runs on the fable tier, so it shares the bench.
+    expect(await attempts(app, "claude-mythos-5", "mythos after the fable refusal")).toEqual(["personal"])
+  }, 20_000)
+
+  it("benches only Fable when the refusal is the credits-era 'reached your Fable limit' banner", async () => {
+    const fableReset = Date.now() + 5 * DAY_MS
+    __setFetchOAuthUsageOverride(async (opts) => opts?.profileId === "work"
+      ? {
+          windows: [
+            { type: "five_hour", utilization: 0.2, resetsAt: Date.now() + 60 * 60_000 },
+            { type: "seven_day", utilization: 0.4, resetsAt: Date.now() + 6 * DAY_MS },
+            { type: "seven_day_fable", utilization: 1, resetsAt: fableReset },
+          ],
+          extraUsage: null,
+          bankedResets: null,
+          fetchedAt: Date.now(),
+        }
+      : null)
+    // Verbatim from Claude Code 2.1.322, betas warning appended as server.ts does.
+    failureMessage = "Claude Code returned an error result: You've reached your Fable limit. Switch to another model, or manage usage credits at https://claude.ai/settings/usage?from=cc_cli_limit_message, to continue.\nSubprocess stderr: Warning: Custom betas are only available for API key users. Ignoring provided betas."
+    failingModelDirs.set("prof-work", "fable")
+    const app = createTestApp()
+
+    const first = await attempts(app, "claude-fable-5-2", "fable refused on work with the reached banner")
+    expect(first[0]).toBe("work")
+    expect(first.at(-1)).toBe("personal")
+    await Bun.sleep(20)
+    const after = await health(app)
+    expect(after.exhausted).toEqual([])
+    expect(after.exhaustedModels).toEqual([{ id: "work", modelFamily: "fable", until: fableReset, reason: "rate_limit_error" }])
+    expect(await quotaSpent(app, "work")).toMatchObject({ diagnosis: { bucket: "seven_day_fable", reported: true }, modelFamily: "fable" })
+    expect(await attempts(app, "claude-opus-4-1", "opus after the reached-banner refusal")).toEqual(["work"])
+  }, 20_000)
+
+  it("benches the whole profile when a reported Fable bucket comes back on an Opus refusal", async () => {
+    failureMessage = FABLE_LIMIT
+    failingModelDirs.set("prof-work", "opus")
+    const app = createTestApp()
+
+    expect((await attempts(app, "claude-opus-4-1", "opus refused with fable wording")).at(-1)).toBe("personal")
+    const after = await health(app)
+    expect(after.exhausted.map(entry => entry.id)).toEqual(["work"])
+    expect(after.exhaustedModels).toEqual([])
+    // The diagnosis still names the Fable bucket, so only modelFamily says
+    // this refusal was not benched for Fable alone.
+    expect(await quotaSpent(app, "work")).toMatchObject({ diagnosis: { bucket: "seven_day_fable", reported: true }, modelFamily: null })
+    expect(await attempts(app, "claude-sonnet-4-5", "sonnet after the mismatched refusal")).toEqual(["personal"])
+  }, 20_000)
+
+  it("benches the whole profile for an account-wide weekly refusal, as before", async () => {
+    failureMessage = "Claude Code returned an error result: You've hit your weekly limit"
+    failingModelDirs.set("prof-work", "opus")
+    const app = createTestApp()
+
+    expect((await attempts(app, "claude-opus-4-1", "weekly refusal on work")).at(-1)).toBe("personal")
+    const after = await health(app)
+    expect(after.exhausted.map(entry => entry.id)).toEqual(["work"])
+    expect(after.exhaustedModels).toEqual([])
+    expect(after.spent.map(entry => entry.modelFamily)).toEqual([null])
+    expect(await attempts(app, "claude-sonnet-4-5", "sonnet after the weekly refusal")).toEqual(["personal"])
+  }, 20_000)
+
+  it("benches the whole profile when the per-model bucket was only guessed from cached usage", async () => {
+    const root = mkdtempSync(join(tmpdir(), "meridian-model-bench-"))
+    const directory = join(root, "work")
+    mkdirSync(directory, { recursive: true })
+    writeFileSync(join(directory, ".credentials.json"), JSON.stringify({
+      claudeAiOauth: { accessToken: "fake-model-bench-token", refreshToken: "fake-refresh", expiresAt: Date.now() + 3_600_000, subscriptionType: "max" },
+    }))
+    // Loaded after the SDK mock is installed, like the rest of this file's proxy modules.
+    const tokens = await import("../proxy/tokenRefresh")
+    tokens.setCredentialStorePlatformForTests("linux")
+    try {
+      const seeded = await fetchOAuthUsageResult({
+        profileId: "work",
+        store: createOwnedCredentialStore(root, directory),
+        fetchImpl: async () => Response.json({ seven_day_opus: { utilization: 95, resets_at: new Date(Date.now() + 3 * DAY_MS).toISOString() } }),
+      })
+      expect(seeded.error).toBeNull()
+    } finally {
+      tokens.setCredentialStorePlatformForTests(null)
+      rmSync(root, { recursive: true, force: true })
+    }
+    // The default failure names no window, so the diagnosis falls back to
+    // the hottest cached one.
+    failingModelDirs.set("prof-work", "opus")
+    const app = createTestApp()
+
+    expect((await attempts(app, "claude-opus-4-1", "unnamed refusal on work")).at(-1)).toBe("personal")
+    const after = await health(app)
+    expect(after.spent.map(entry => entry.diagnosis)).toEqual([expect.objectContaining({ bucket: "seven_day_opus", reported: false, source: "cached_usage" })])
+    expect(after.exhausted.map(entry => entry.id)).toEqual(["work"])
+    expect(after.exhaustedModels).toEqual([])
+    expect(after.spent.map(entry => entry.modelFamily)).toEqual([null])
+    expect(await attempts(app, "claude-sonnet-4-5", "sonnet after the guessed refusal")).toEqual(["personal"])
+  }, 20_000)
+
+  it("skips a Fable-benched active profile only for Fable in active+priority mode, streaming too", async () => {
+    process.env.MERIDIAN_ROUTING = "active+priority"
+    failureMessage = FABLE_LIMIT
+    failingModelDirs.set("prof-work", "fable")
+    const app = createTestApp()
+
+    const first = await attempts(app, "claude-fable-5-2", "streamed fable refusal", true)
+    expect(first[0]).toBe("work")
+    expect(first.at(-1)).toBe("personal")
+    expect((await health(app)).exhaustedModels.map(entry => [entry.id, entry.modelFamily])).toEqual([["work", "fable"]])
+    expect(await attempts(app, "claude-sonnet-4-5", "sonnet on the active profile", true)).toEqual(["work"])
+    expect(await attempts(app, "claude-fable-5-2", "fable skips the active profile", true)).toEqual(["personal"])
+  }, 20_000)
+})
+
+describe("keyless priority affinity", () => {
+  beforeEach(async () => {
+    capturedEnvs = []
+    failingDirs = new Set()
+    await clearSessionCache()
     resetActiveProfile()
     rateLimitStore.clear()
     // Mirror the existing blocks exactly — MERIDIAN_PROFILE_ORDER matters,
@@ -2246,4 +3125,841 @@ describe("keyless priority affinity", () => {
     expect(fork.status).toBe(200)
     expect(capturedEnvs.every((e) => e.includes("prof-personal"))).toBe(true)
   }, 30_000)
+})
+
+describe("re-authenticated profile unbenching (#1385)", () => {
+  let storeOverride: { mockRestore(): void }
+  let tempDir = ""
+  let originalFetch: typeof globalThis.fetch
+  let credentialDirs: Array<string | undefined> = []
+  let resetRequests: Array<{ url: string; authorization: string | null }> = []
+
+  async function healthSnapshots(app: TestApp) {
+    const res = await app.fetch(new Request("http://localhost/profiles/list"))
+    const body = await res.json() as {
+      exhausted?: Array<{ id: string; until: number; reason: string }>
+      spent?: Array<{ profileId: string; until: number; diagnosis: { bucket: string | null } }>
+    }
+    return {
+      exhausted: body.exhausted ?? [],
+      spent: body.spent ?? [],
+    }
+  }
+
+  function stubOAuthEndpoints(status = 200, resetOutcome?: unknown, resetStatus = 200) {
+    const syntheticFetch = Object.assign(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const url = String(input)
+        if (url === "https://api.anthropic.com/api/oauth/profile") {
+          return Response.json({
+            organization: {
+              uuid: "00000000-0000-4000-8000-000000000001",
+              organization_type: "claude_max",
+              rate_limit_tier: "default_claude_max_5x",
+            },
+          })
+        }
+        if (url === "https://platform.claude.com/v1/oauth/token") {
+          if (status !== 200) {
+            return Response.json({ error: "invalid_grant" }, { status })
+          }
+          return Response.json({
+            access_token: "fresh-access-token",
+            refresh_token: "fresh-refresh-token",
+            expires_in: 3600,
+          })
+        }
+        if (url.endsWith("/reset_rate_limits") && resetOutcome !== undefined) {
+          resetRequests.push({ url, authorization: new Headers(init?.headers).get("Authorization") })
+          if (typeof resetOutcome === "function") return resetOutcome()
+          return Response.json(resetOutcome, { status: resetStatus })
+        }
+        throw new Error(`Unexpected fetch in #1385 test: ${url}`)
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    globalThis.fetch = syntheticFetch
+    expect(globalThis.fetch).toBe(syntheticFetch)
+  }
+
+  function createReauthTestApp(): { app: TestApp; workDir: string; personalDir: string } {
+    const { mkdirSync } = require("node:fs") as typeof import("node:fs")
+    const { join } = require("node:path") as typeof import("node:path")
+    const workDir = join(tempDir, "prof-work")
+    const personalDir = join(tempDir, "prof-personal")
+    mkdirSync(workDir, { recursive: true })
+    mkdirSync(personalDir, { recursive: true })
+    const { app } = createProxyServer({
+      port: 0,
+      host: "127.0.0.1",
+      profiles: [
+        { id: "work", claudeConfigDir: workDir },
+        { id: "personal", claudeConfigDir: personalDir },
+      ],
+      defaultProfile: "work",
+      silent: true,
+    })
+    return { app, workDir, personalDir }
+  }
+
+  beforeEach(async () => {
+    const { mkdtempSync } = await import("node:fs")
+    const { tmpdir } = await import("node:os")
+    const { join } = await import("node:path")
+    const { resetPendingLogins } = await import("../proxy/profileLogin")
+    const { resetInflightRefresh, setCredentialStorePlatformForTests, stopBackgroundRefresh } = await import("../proxy/tokenRefresh")
+
+    originalFetch = globalThis.fetch
+    // Proactive refresh can run on the first mocked HTTP turn, before the
+    // explicit login/refresh request below. Refuse all other network paths.
+    stubOAuthEndpoints(200)
+    tempDir = mkdtempSync(join(tmpdir(), "meridian-reauth-1385-"))
+    setCredentialStorePlatformForTests("linux")
+    // These four controls intentionally persist synthetic OAuth tokens in their
+    // newly owned directories. Keep the real file backend behind a path guard;
+    // all other SDK-mocked tests retain the empty default store.
+    const tokens = await import("../proxy/tokenRefresh")
+    credentialDirs = []
+    resetRequests = []
+    storeOverride = spyOn(tokens, "createPlatformCredentialStore").mockImplementation(options => {
+      credentialDirs.push(options?.claudeConfigDir)
+      return createOwnedCredentialStore(tempDir, options?.claudeConfigDir ?? join(tempDir, "prof-default"))
+    })
+    resetPendingLogins()
+    resetInflightRefresh()
+    stopBackgroundRefresh()
+    resetProcessSdkSemaphoreForTests()
+    capturedEnvs = []
+    failingDirs = new Set()
+    await clearSessionCache()
+    resetActiveProfile()
+    rateLimitStore.clear()
+    resetOAuthUsageCache()
+    savedEnv.MERIDIAN_ROUTING = process.env.MERIDIAN_ROUTING
+    savedEnv.MERIDIAN_PROFILE_ORDER = process.env.MERIDIAN_PROFILE_ORDER
+    savedEnv.MERIDIAN_PRIORITY_FAILBACK = process.env.MERIDIAN_PRIORITY_FAILBACK
+    savedEnv.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS = process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS
+    savedEnv.MERIDIAN_CREDENTIALS_READONLY = process.env.MERIDIAN_CREDENTIALS_READONLY
+    savedEnv.CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR
+    delete process.env.CLAUDE_CONFIG_DIR
+    delete process.env.MERIDIAN_CREDENTIALS_READONLY
+    delete process.env.MERIDIAN_PRIORITY_FAILBACK
+    process.env.MERIDIAN_ROUTING = "priority"
+    process.env.MERIDIAN_PROFILE_ORDER = "work,personal"
+    process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS = "1"
+  })
+
+  afterEach(async () => {
+    const { rmSync } = await import("node:fs")
+    const { resetPendingLogins } = await import("../proxy/profileLogin")
+    const { resetInflightRefresh, setCredentialStorePlatformForTests, stopBackgroundRefresh } = await import("../proxy/tokenRefresh")
+
+    globalThis.fetch = originalFetch
+    storeOverride.mockRestore()
+    setCredentialStorePlatformForTests(null)
+    resetPendingLogins()
+    resetInflightRefresh()
+    stopBackgroundRefresh()
+    resetProcessSdkSemaphoreForTests()
+    rateLimitStore.clear()
+    resetOAuthUsageCache()
+    if (tempDir) rmSync(tempDir, { recursive: true, force: true })
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v !== undefined) process.env[k] = v
+      else delete process.env[k]
+    }
+  })
+
+  async function seedResetCredentials(directory: string, token = "fake-reset-work"): Promise<void> {
+    mkdirSync(directory, { recursive: true })
+    writeFileSync(join(directory, ".credentials.json"), JSON.stringify({
+      claudeAiOauth: { accessToken: token, refreshToken: "fake-refresh", expiresAt: Date.now() + 3_600_000, subscriptionType: "max" },
+    }))
+  }
+
+  async function resetQuota(app: TestApp, profile = "work", ids: { grantId?: string; requestId?: string } = {}): Promise<Response> {
+    return app.fetch(new Request("http://localhost/v1/usage/quota/reset", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile, grantId: ids.grantId ?? "fake-grant", requestId: ids.requestId ?? "fake-request" }),
+    }))
+  }
+
+  it("answers a concurrent redemption with reset_in_progress and replays a settled request ID", async () => {
+    const { app, workDir } = createReauthTestApp()
+    await seedResetCredentials(workDir)
+    const release = Promise.withResolvers<Response>()
+    const posted = Promise.withResolvers<void>()
+    stubOAuthEndpoints(200, () => {
+      posted.resolve()
+      return release.promise
+    })
+    const first = resetQuota(app)
+    await posted.promise
+    const concurrent = await resetQuota(app, "work", { requestId: "fake-other-request" })
+    expect(concurrent.status).toBe(409)
+    expect(concurrent.headers.get("cache-control")).toBe("no-store")
+    expect(await concurrent.json()).toEqual({ code: "reset_in_progress", error: expect.any(String), indeterminate: false })
+    release.resolve(Response.json({ result: "reset", resets_left: 0, cleared: ["five_hour"] }))
+    const settled = await first
+    expect(settled.status).toBe(200)
+    const settledBody = await settled.json() as Record<string, unknown>
+    expect(settledBody).toMatchObject({ profile: "work", grantId: "fake-grant", requestId: "fake-request", result: "reset", replayed: false })
+    rateLimitStore.record("work", { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt: Date.now() + 3_600_000 })
+    const replay = await resetQuota(app)
+    expect(replay.status).toBe(200)
+    expect(await replay.json()).toEqual({ ...settledBody, replayed: true })
+    expect(rateLimitStore.get("work", "five_hour")?.status).toBe("rejected")
+    const conflict = await resetQuota(app, "work", { grantId: "fake-other-grant" })
+    expect(conflict.status).toBe(409)
+    expect(await conflict.json()).toMatchObject({ code: "request_id_conflict", indeterminate: false })
+    expect(resetRequests).toHaveLength(1)
+  })
+
+  it("replays an indeterminate outcome instead of re-sending a blind retry", async () => {
+    const { app, workDir } = createReauthTestApp()
+    await seedResetCredentials(workDir)
+    stubOAuthEndpoints(200, () => { throw new Error("Synthetic connection loss") })
+    const first = await resetQuota(app)
+    expect(first.status).toBe(502)
+    expect(await first.json()).toEqual({ code: "reset_indeterminate", error: expect.any(String), indeterminate: true, replayed: false })
+    const retry = await resetQuota(app)
+    expect(retry.status).toBe(502)
+    expect(await retry.json()).toEqual({ code: "reset_indeterminate", error: expect.any(String), indeterminate: true, replayed: true })
+    expect(resetRequests).toHaveLength(1)
+  })
+
+  it("rejects inferred token reset targets without consulting any credential store", async () => {
+    const { app } = createProxyServer({
+      port: 0, host: "127.0.0.1", silent: true,
+      profiles: [
+        { id: "inferred", oauthToken: "fake-token" },
+        { id: "mislabelled", type: "claude-max", oauthToken: "fake-token" },
+      ],
+    })
+    credentialDirs = []
+    for (const profile of ["inferred", "mislabelled"]) {
+      const response = await resetQuota(app, profile)
+      expect(response.status).toBe(400)
+      expect(await response.json()).toMatchObject({ code: "not_oauth" })
+    }
+    expect(credentialDirs).toEqual([])
+    expect(resetRequests).toEqual([])
+  })
+
+  it("targets a named account instead of the active default and invalidates only that account's usage", async () => {
+    const { app, workDir, personalDir } = createReauthTestApp()
+    for (const [profileId, directory] of [["work", workDir], ["personal", personalDir]] as const) {
+      await seedResetCredentials(directory, `fake-${profileId}-token`)
+      await fetchOAuthUsage({
+        profileId, store: createOwnedCredentialStore(tempDir, directory),
+        fetchImpl: async () => Response.json({ five_hour: { utilization: 100 } }),
+      })
+    }
+    expect(peekOAuthUsage("work")).toBeDefined()
+    expect(peekOAuthUsage("personal")).toBeDefined()
+    stubOAuthEndpoints(200, { result: "reset", cleared: ["five_hour"] })
+    credentialDirs = []
+    const response = await resetQuota(app, "personal")
+    expect(response.status).toBe(200)
+    expect(credentialDirs).toEqual([personalDir])
+    expect(resetRequests).toEqual([expect.objectContaining({ authorization: "Bearer fake-personal-token" })])
+    expect(peekOAuthUsage("personal")).toBeUndefined()
+    expect(peekOAuthUsage("work")).toBeDefined()
+  })
+
+  it("targets explicit single-account default credentials and invalidates the unscoped usage cache", async () => {
+    const directory = join(tempDir, "prof-default")
+    await seedResetCredentials(directory, "fake-default-token")
+    resetOAuthUsageCache()
+    await fetchOAuthUsage({
+      store: createOwnedCredentialStore(tempDir, directory),
+      fetchImpl: async () => Response.json({ five_hour: { utilization: 100 } }),
+    })
+    expect(peekOAuthUsage()).toBeDefined()
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1", silent: true })
+    stubOAuthEndpoints(200, { result: "reset", cleared: ["five_hour"] })
+    credentialDirs = []
+    const response = await resetQuota(app, "default")
+    expect(response.status).toBe(200)
+    expect(credentialDirs).toEqual([undefined])
+    expect(resetRequests).toEqual([expect.objectContaining({
+      authorization: "Bearer fake-default-token",
+      url: "https://api.anthropic.com/api/organizations/00000000-0000-4000-8000-000000000001/reset_rate_limits",
+    })])
+    expect(peekOAuthUsage()).toBeUndefined()
+    resetOAuthUsageCache()
+  })
+
+  it("retains weekly and model refusals, spent state and routing exclusion after a session-only reset", async () => {
+    const { app, workDir } = createReauthTestApp()
+    await seedResetCredentials(workDir)
+    const observedAt = Date.now()
+    const resetsAt = observedAt + 3_600_000
+    for (const rateLimitType of ["five_hour", "seven_day", "seven_day_opus"] as const) {
+      rateLimitStore.record("work", { status: "rejected", rateLimitType, utilization: 1, resetsAt }, rateLimitType === "five_hour" ? observedAt - 1 : observedAt)
+    }
+    rateLimitStore.record("personal", { status: "allowed", rateLimitType: "five_hour", utilization: 0.2 })
+    failingDirs.add("prof-work")
+    expect((await post(app, {}, "before partial reset")).status).toBe(200)
+    const before = await healthSnapshots(app)
+    expect(before.spent.map(entry => entry.profileId)).toEqual(["work"])
+    expect(before.spent[0]?.diagnosis.bucket).toBe("seven_day")
+    stubOAuthEndpoints(200, { result: "reset", cleared: ["five_hour"] })
+    const response = await resetQuota(app)
+    expect(response.status).toBe(200)
+    expect(resetRequests[0]?.authorization).toBe("Bearer fake-reset-work")
+    expect(rateLimitStore.get("work", "five_hour")).toBeUndefined()
+    expect(rateLimitStore.get("work", "seven_day")?.status).toBe("rejected")
+    expect(rateLimitStore.get("work", "seven_day_opus")?.status).toBe("rejected")
+    expect(rateLimitStore.get("personal", "five_hour")?.utilization).toBe(0.2)
+    expect(await healthSnapshots(app)).toEqual(before)
+    failingDirs.delete("prof-work")
+    capturedEnvs = []
+    expect((await post(app, {}, "after partial reset")).status).toBe(200)
+    expect(capturedEnvs.length).toBeGreaterThan(0)
+    expect(capturedEnvs.every(dir => dir.includes("prof-personal"))).toBe(true)
+  }, 20_000)
+
+  it("removes a cleared session spent label while retaining an uncleared weekly routing exclusion", async () => {
+    const { app, workDir } = createReauthTestApp()
+    await seedResetCredentials(workDir)
+    const resetsAt = Date.now() + 3_600_000
+    rateLimitStore.record("work", { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt })
+    failingDirs.add("prof-work")
+    expect((await post(app, {}, "session refusal before weekly evidence")).status).toBe(200)
+    const before = await healthSnapshots(app)
+    expect(before.spent[0]?.diagnosis.bucket).toBe("five_hour")
+    rateLimitStore.record("work", { status: "rejected", rateLimitType: "seven_day", utilization: 1, resetsAt })
+    stubOAuthEndpoints(200, { result: "reset", cleared: ["five_hour"] })
+    expect((await resetQuota(app)).status).toBe(200)
+    expect(await healthSnapshots(app)).toEqual({ spent: [], exhausted: before.exhausted })
+    expect(rateLimitStore.get("work", "five_hour")).toBeUndefined()
+    expect(rateLimitStore.get("work", "seven_day")?.status).toBe("rejected")
+    failingDirs.delete("prof-work")
+    capturedEnvs = []
+    expect((await post(app, {}, "weekly remains after session label cleared")).status).toBe(200)
+    expect(capturedEnvs.length).toBeGreaterThan(0)
+    expect(capturedEnvs.every(dir => dir.includes("prof-personal"))).toBe(true)
+  }, 20_000)
+
+  it("retains independent overage refusal and routing exclusion after clearing the session window", async () => {
+    const { app, workDir } = createReauthTestApp()
+    await seedResetCredentials(workDir)
+    const observedAt = Date.now()
+    const resetsAt = observedAt + 3_600_000
+    rateLimitStore.record("work", {
+      status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt,
+      overageStatus: "rejected", overageResetsAt: resetsAt, isUsingOverage: true,
+    }, observedAt)
+    failingDirs.add("prof-work")
+    expect((await post(app, {}, "session with independent overage refusal")).status).toBe(200)
+    const before = await healthSnapshots(app)
+    expect(before.spent[0]?.diagnosis.bucket).toBe("five_hour")
+    stubOAuthEndpoints(200, { result: "reset", cleared: ["five_hour", "seven_day_overage_included"] })
+    expect((await resetQuota(app)).status).toBe(200)
+    expect(rateLimitStore.get("work", "five_hour")).toMatchObject({
+      status: "allowed", observedAt, overageStatus: "rejected", overageResetsAt: resetsAt, isUsingOverage: true,
+    })
+    expect(rateLimitStore.get("work", "five_hour")?.utilization).toBeUndefined()
+    expect(rateLimitStore.get("work", "five_hour")?.resetsAt).toBeUndefined()
+    expect(await healthSnapshots(app)).toEqual({ spent: [], exhausted: before.exhausted })
+    failingDirs.delete("prof-work")
+    capturedEnvs = []
+    expect((await post(app, {}, "overage still excludes reset account")).status).toBe(200)
+    expect(capturedEnvs.length).toBeGreaterThan(0)
+    expect(capturedEnvs.every(dir => dir.includes("prof-personal"))).toBe(true)
+  }, 20_000)
+
+  it("unbenches a matching cleared refusal without touching another exhausted profile", async () => {
+    const { app, workDir } = createReauthTestApp()
+    await seedResetCredentials(workDir)
+    const resetsAt = Date.now() + 3_600_000
+    for (const profile of ["work", "personal"]) {
+      rateLimitStore.record(profile, { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt })
+    }
+    failingDirs.add("prof-work")
+    failingDirs.add("prof-personal")
+    expect((await post(app, {}, "before matching reset")).status).toBe(429)
+    stubOAuthEndpoints(200, { result: "reset", cleared: ["five_hour"] })
+    expect((await resetQuota(app)).status).toBe(200)
+    expect((await healthSnapshots(app)).spent.map(entry => entry.profileId)).toEqual(["personal"])
+    expect((await healthSnapshots(app)).exhausted.map(entry => entry.id)).toEqual(["personal"])
+    expect(rateLimitStore.get("personal", "five_hour")?.status).toBe("rejected")
+    failingDirs.delete("prof-work")
+    capturedEnvs = []
+    expect((await post(app, {}, "after matching reset")).status).toBe(200)
+    expect(capturedEnvs).toHaveLength(1)
+    expect(capturedEnvs[0]).toContain("prof-work")
+  }, 20_000)
+
+  it("allows a matching named session refusal to be re-probed even without a reset timestamp", async () => {
+    const { app, workDir } = createReauthTestApp()
+    await seedResetCredentials(workDir)
+    failureMessage = "Claude Code returned an error result: You've hit your session limit"
+    failingDirs.add("prof-work")
+    expect((await post(app, {}, "session refusal without clock")).status).toBe(200)
+    expect((await healthSnapshots(app)).spent.map(entry => entry.profileId)).toEqual(["work"])
+    stubOAuthEndpoints(200, { result: "reset", cleared: ["five_hour"] })
+    expect((await resetQuota(app)).status).toBe(200)
+    expect(await healthSnapshots(app)).toEqual({ exhausted: [], spent: [] })
+    failingDirs.delete("prof-work")
+    capturedEnvs = []
+    expect((await post(app, {}, "retry cleared session without clock")).status).toBe(200)
+    expect(capturedEnvs).toHaveLength(1)
+    expect(capturedEnvs[0]).toContain("prof-work")
+  }, 20_000)
+
+  for (const scenario of [
+    { name: "empty cleared list", body: { result: "reset", cleared: [] }, status: 200, expectedStatus: 200 },
+    { name: "already used grant", body: { result: "already_used", cleared: ["five_hour"] }, status: 200, expectedStatus: 200 },
+    ...["not_limited", "cooldown", "ineligible", "unavailable"].map(result => ({
+      name: result, body: { result, cleared: ["five_hour"] }, status: 200, expectedStatus: 200,
+    })),
+    { name: "uncertain mutation", body: { error: "unavailable" }, status: 503, expectedStatus: 502 },
+  ]) {
+    it(`preserves known quota health after ${scenario.name}`, async () => {
+      const { app, workDir } = createReauthTestApp()
+      await seedResetCredentials(workDir)
+      rateLimitStore.record("work", { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt: Date.now() + 3_600_000 })
+      failingDirs.add("prof-work")
+      expect((await post(app, {}, `before ${scenario.name}`)).status).toBe(200)
+      const before = await healthSnapshots(app)
+      stubOAuthEndpoints(200, scenario.body, scenario.status)
+      expect((await resetQuota(app)).status).toBe(scenario.expectedStatus)
+      expect(await healthSnapshots(app)).toEqual(before)
+      expect(rateLimitStore.get("work", "five_hour")?.status).toBe("rejected")
+    }, 20_000)
+  }
+
+  it("lifts a model bench when a confirmed reset clears that model's bucket", async () => {
+    const { app, workDir } = createReauthTestApp()
+    await seedResetCredentials(workDir)
+    rateLimitStore.record("work", { status: "rejected", rateLimitType: "seven_day_opus", utilization: 1, resetsAt: Date.now() + 3 * 24 * 60 * 60_000 })
+    failingModelDirs.set("prof-work", "opus")
+    expect((await postMessages(app, { model: "claude-opus-4-1", content: "opus before model reset", stream: false })).status).toBe(200)
+    const health = async () => await (await app.fetch(new Request("http://localhost/profiles/health"))).json() as {
+      exhaustedModels: Array<{ id: string; modelFamily: string }>
+      spent: unknown[]
+    }
+    expect((await health()).exhaustedModels.map(entry => [entry.id, entry.modelFamily])).toEqual([["work", "opus"]])
+    stubOAuthEndpoints(200, { result: "reset", cleared: ["seven_day_opus"] })
+    expect((await resetQuota(app)).status).toBe(200)
+    expect(await health()).toMatchObject({ exhaustedModels: [], spent: [] })
+    failingModelDirs.clear()
+    capturedEnvs = []
+    expect((await postMessages(app, { model: "claude-opus-4-1", content: "opus after model reset", stream: false })).status).toBe(200)
+    expect(capturedEnvs).toHaveLength(1)
+    expect(capturedEnvs[0]).toContain("prof-work")
+  }, 20_000)
+
+  it("lifts a profile-wide bench whose refusal named another model's bucket when that bucket is cleared", async () => {
+    const { app, workDir } = createReauthTestApp()
+    await seedResetCredentials(workDir)
+    failureMessage = "Claude Code returned an error result: You've hit your Fable limit"
+    failingModelDirs.set("prof-work", "opus")
+    expect((await postMessages(app, { model: "claude-opus-4-1", content: "opus refused with fable wording before reset", stream: false })).status).toBe(200)
+    const health = async () => await (await app.fetch(new Request("http://localhost/profiles/health"))).json() as {
+      exhausted: Array<{ id: string }>
+      exhaustedModels: unknown[]
+    }
+    expect((await health()).exhausted.map(entry => entry.id)).toEqual(["work"])
+    stubOAuthEndpoints(200, { result: "reset", cleared: ["seven_day_fable"] })
+    expect((await resetQuota(app)).status).toBe(200)
+    expect(await health()).toMatchObject({ exhausted: [], exhaustedModels: [] })
+  }, 20_000)
+
+  it("preserves quota refusals whose bucket was never identified", async () => {
+    const { app, workDir } = createReauthTestApp()
+    await seedResetCredentials(workDir)
+    failingDirs.add("prof-work")
+    expect((await post(app, {}, "unknown refusal before reset")).status).toBe(200)
+    const before = await healthSnapshots(app)
+    expect(before.spent.map(entry => entry.profileId)).toEqual(["work"])
+    stubOAuthEndpoints(200, { result: "reset", cleared: ["five_hour", "seven_day"] })
+    expect((await resetQuota(app)).status).toBe(200)
+    expect(await healthSnapshots(app)).toEqual(before)
+  }, 20_000)
+
+  it("preserves non-quota exhaustion when quota buckets happen to be cleared", async () => {
+    const { app, workDir } = createReauthTestApp()
+    await seedResetCredentials(workDir)
+    failureMessage = SUBSCRIPTION_REFUSAL
+    failingDirs.add("prof-work")
+    expect((await post(app, {}, "billing refusal before reset")).status).toBe(200)
+    const before = await healthSnapshots(app)
+    expect(before.exhausted).toEqual([expect.objectContaining({ id: "work", reason: "billing_error" })])
+    stubOAuthEndpoints(200, { result: "reset", cleared: ["five_hour", "seven_day"] })
+    expect((await resetQuota(app)).status).toBe(200)
+    expect(await healthSnapshots(app)).toEqual(before)
+  }, 20_000)
+
+  it("clears exhausted and spent state when /profiles/login/complete succeeds so the next request routes to the re-authenticated profile", async () => {
+    const resetsAt = Date.now() + 60 * 60_000
+    rateLimitStore.record("work", {
+      status: "rejected",
+      rateLimitType: "five_hour",
+      utilization: 1,
+      resetsAt,
+    })
+    failingDirs.add("prof-work")
+    const { app } = createReauthTestApp()
+
+    const first = await post(app, {}, "conv-1 before reauth")
+    expect(first.status).toBe(200)
+    expect(await healthSnapshots(app)).toEqual({
+      exhausted: [expect.objectContaining({ id: "work", reason: "rate_limit_error" })],
+      spent: [expect.objectContaining({ profileId: "work" })],
+    })
+    expect(rateLimitStore.get("work", "five_hour")).toBeDefined()
+
+    // Even if upstream would now accept work, the stale bench keeps skipping it.
+    failingDirs.delete("prof-work")
+    capturedEnvs = []
+    const stillBenched = await post(app, {}, "conv-2 while still benched")
+    expect(stillBenched.status).toBe(200)
+    expect(capturedEnvs.every((e) => e.includes("prof-personal"))).toBe(true)
+
+    // Re-authenticate work via /profiles/login/start + /profiles/login/complete.
+    const started = await app.fetch(new Request("http://localhost/profiles/login/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile: "work" }),
+    }))
+    expect(started.status).toBe(200)
+    const { loginId } = await started.json() as { loginId: string }
+
+    stubOAuthEndpoints(200)
+    const completed = await app.fetch(new Request("http://localhost/profiles/login/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ loginId, code: "reauth-code-123" }),
+    }))
+    expect(completed.status).toBe(200)
+
+    expect(await healthSnapshots(app)).toEqual({ exhausted: [], spent: [] })
+    expect(rateLimitStore.get("work", "five_hour")).toBeUndefined()
+
+    capturedEnvs = []
+    const afterReauth = await post(app, {}, "conv-3 after reauth")
+    expect(afterReauth.status).toBe(200)
+    expect(capturedEnvs).toHaveLength(1)
+    expect(capturedEnvs[0]).toContain("prof-work")
+  }, 20_000)
+
+  it("clears exhausted and spent state when browser loopback /callback completes login", async () => {
+    const resetsAt = Date.now() + 60 * 60_000
+    rateLimitStore.record("work", {
+      status: "rejected",
+      rateLimitType: "five_hour",
+      utilization: 1,
+      resetsAt,
+    })
+    failingDirs.add("prof-work")
+    const { app } = createReauthTestApp()
+
+    expect((await post(app, {}, "callback conv-1")).status).toBe(200)
+    expect((await healthSnapshots(app)).exhausted.map((e) => e.id)).toEqual(["work"])
+    expect((await healthSnapshots(app)).spent.map((s) => s.profileId)).toEqual(["work"])
+
+    const started = await app.fetch(new Request("http://localhost/profiles/login/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", host: "127.0.0.1:3457" },
+      body: JSON.stringify({ profile: "work" }),
+    }))
+    const { authorizeUrl } = await started.json() as { authorizeUrl: string }
+    const state = new URL(authorizeUrl).searchParams.get("state") ?? ""
+
+    stubOAuthEndpoints(200)
+    const callbackRes = await app.fetch(
+      new Request(`http://localhost/callback?code=loopback-code&state=${encodeURIComponent(state)}`),
+    )
+    expect(callbackRes.status).toBe(200)
+    expect(await healthSnapshots(app)).toEqual({ exhausted: [], spent: [] })
+
+    failingDirs.delete("prof-work")
+    capturedEnvs = []
+    const afterCallback = await post(app, {}, "callback conv-2")
+    expect(afterCallback.status).toBe(200)
+    expect(capturedEnvs).toHaveLength(1)
+    expect(capturedEnvs[0]).toContain("prof-work")
+  }, 20_000)
+
+  it("clears only the refreshed profile on POST /auth/refresh and leaves other profiles benched", async () => {
+    const { writeFileSync } = await import("node:fs")
+    const { join } = await import("node:path")
+    const { app, workDir, personalDir } = createReauthTestApp()
+    for (const dir of [workDir, personalDir]) {
+      writeFileSync(join(dir, ".credentials.json"), JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "old-access",
+          refreshToken: "old-refresh",
+          expiresAt: Date.now() - 1_000,
+          subscriptionType: "max",
+        },
+      }))
+    }
+
+    const resetsAt = Date.now() + 60 * 60_000
+    rateLimitStore.record("work", { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt })
+    rateLimitStore.record("personal", { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt })
+    failingDirs.add("prof-work")
+    failingDirs.add("prof-personal")
+
+    // Both accounts fail -> both get marked exhausted and spent.
+    expect((await post(app, {}, "exhaust both")).status).toBe(429)
+    const beforeRefresh = await healthSnapshots(app)
+    expect(beforeRefresh.exhausted.map((e) => e.id).sort()).toEqual(["personal", "work"])
+    expect(beforeRefresh.spent.map((s) => s.profileId).sort()).toEqual(["personal", "work"])
+
+    stubOAuthEndpoints(200)
+    const refreshRes = await app.fetch(new Request("http://localhost/auth/refresh", {
+      method: "POST",
+      headers: { "x-meridian-profile": "work" },
+    }))
+    expect(refreshRes.status).toBe(200)
+
+    const afterRefresh = await healthSnapshots(app)
+    expect(afterRefresh.exhausted.map((e) => e.id)).toEqual(["personal"])
+    expect(afterRefresh.spent.map((s) => s.profileId)).toEqual(["personal"])
+    expect(rateLimitStore.get("work", "five_hour")).toBeUndefined()
+    expect(rateLimitStore.get("personal", "five_hour")).toBeDefined()
+
+    failingDirs.delete("prof-work")
+    capturedEnvs = []
+    const afterWorkRefresh = await post(app, {}, "after work refresh")
+    expect(afterWorkRefresh.status).toBe(200)
+    expect(capturedEnvs).toHaveLength(1)
+    expect(capturedEnvs[0]).toContain("prof-work")
+  }, 20_000)
+
+  it("keeps the profile benched when login completion or token refresh fails", async () => {
+    const { writeFileSync } = await import("node:fs")
+    const { join } = await import("node:path")
+    const { app, workDir } = createReauthTestApp()
+    writeFileSync(join(workDir, ".credentials.json"), JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "old-access",
+        refreshToken: "old-refresh",
+        expiresAt: Date.now() - 1_000,
+        subscriptionType: "max",
+      },
+    }))
+
+    const resetsAt = Date.now() + 60 * 60_000
+    rateLimitStore.record("work", { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt })
+    failingDirs.add("prof-work")
+
+    expect((await post(app, {}, "bench work")).status).toBe(200)
+    expect((await healthSnapshots(app)).exhausted.map((e) => e.id)).toEqual(["work"])
+
+    const started = await app.fetch(new Request("http://localhost/profiles/login/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile: "work" }),
+    }))
+    const { loginId } = await started.json() as { loginId: string }
+
+    stubOAuthEndpoints(400)
+    const failedLogin = await app.fetch(new Request("http://localhost/profiles/login/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ loginId, code: "bad-code" }),
+    }))
+    expect(failedLogin.status).toBe(502)
+
+    const failedRefresh = await app.fetch(new Request("http://localhost/auth/refresh", {
+      method: "POST",
+      headers: { "x-meridian-profile": "work" },
+    }))
+    expect(failedRefresh.status).toBe(500)
+
+    const stillBenched = await healthSnapshots(app)
+    expect(stillBenched.exhausted.map((e) => e.id)).toEqual(["work"])
+    expect(stillBenched.spent.map((s) => s.profileId)).toEqual(["work"])
+  }, 20_000)
+})
+
+describe("priority weekly reserve", () => {
+  const WEEK_RESET = Date.now() + 3 * 24 * 60 * 60_000
+  let savedWeeklyReserveSetting: Record<string, number> | undefined
+
+  function recordWeekly(profileId: string, utilization: number, resetsAt = WEEK_RESET): void {
+    rateLimitStore.record(profileId, { status: "allowed", rateLimitType: "seven_day", utilization, resetsAt })
+  }
+
+  beforeEach(async () => {
+    resetProcessSdkSemaphoreForTests()
+    capturedEnvs = []
+    failingDirs = new Set()
+    await clearSessionCache()
+    resetActiveProfile()
+    for (const key of ["MERIDIAN_ROUTING", "MERIDIAN_PROFILE_ORDER", "MERIDIAN_PRIORITY_FAILBACK", "MERIDIAN_WEEKLY_RESERVE", "CLAUDE_CONFIG_DIR", "MERIDIAN_OPENCODE_ATTESTATION_KEY"]) {
+      savedEnv[key] = process.env[key]
+    }
+    process.env.MERIDIAN_OPENCODE_ATTESTATION_KEY = PRIORITY_ATTESTATION_TEST_KEY.toString("base64url")
+    capturedSdkCalls = []
+    delete process.env.CLAUDE_CONFIG_DIR
+    delete process.env.MERIDIAN_PRIORITY_FAILBACK
+    process.env.MERIDIAN_ROUTING = "priority"
+    process.env.MERIDIAN_PROFILE_ORDER = "work,personal"
+    process.env.MERIDIAN_WEEKLY_RESERVE = "work=20"
+    savedWeeklyReserveSetting = loadSettings().weeklyReserve
+    rateLimitStore.clear()
+    resetOAuthUsageCache()
+  })
+
+  afterEach(() => {
+    resetProcessSdkSemaphoreForTests()
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+    saveSettings({ weeklyReserve: savedWeeklyReserveSetting })
+    rateLimitStore.clear()
+    resetOAuthUsageCache()
+  })
+
+  it("skips the preferred profile once it reaches its reserve line", async () => {
+    recordWeekly("work", 0.85)
+    const app = createTestApp()
+    const res = await post(app, {}, "weekly reserve holds work")
+    expect(res.status).toBe(200)
+    expect(capturedEnvs).toHaveLength(1)
+    expect(capturedEnvs[0]).toContain("prof-personal")
+  }, 20_000)
+
+  it("keeps using the preferred profile below the line", async () => {
+    recordWeekly("work", 0.79)
+    const app = createTestApp()
+    const res = await post(app, {}, "weekly reserve below line")
+    expect(res.status).toBe(200)
+    expect(capturedEnvs[0]).toContain("prof-work")
+  }, 20_000)
+
+  it("returns the profile to the pool once its weekly window has reset", async () => {
+    recordWeekly("work", 0.95, Date.now() - 1000)
+    const app = createTestApp()
+    const res = await post(app, {}, "weekly reserve after reset")
+    expect(res.status).toBe(200)
+    expect(capturedEnvs[0]).toContain("prof-work")
+  }, 20_000)
+
+  it("reads the reserve from cached OAuth usage without fetching", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs")
+    const { tmpdir } = await import("node:os")
+    const root = mkdtempSync(join(tmpdir(), "meridian-weekly-reserve-"))
+    const directory = join(root, "work")
+    mkdirSync(directory, { recursive: true })
+    writeFileSync(join(directory, ".credentials.json"), JSON.stringify({
+      claudeAiOauth: { accessToken: "fake-weekly-token", refreshToken: "fake-refresh", expiresAt: Date.now() + 3_600_000, subscriptionType: "max" },
+    }))
+    const tokens = await import("../proxy/tokenRefresh")
+    // File-backed store on every platform: never the login Keychain.
+    tokens.setCredentialStorePlatformForTests("linux")
+    let seeded: Awaited<ReturnType<typeof fetchOAuthUsageResult>>
+    try {
+      seeded = await fetchOAuthUsageResult({
+        profileId: "work",
+        store: createOwnedCredentialStore(root, directory),
+        fetchImpl: async () => Response.json({ seven_day: { utilization: 90, resets_at: new Date(WEEK_RESET).toISOString() } }),
+      })
+    } finally {
+      tokens.setCredentialStorePlatformForTests(null)
+      rmSync(root, { recursive: true, force: true })
+    }
+    expect(seeded.error).toBeNull()
+    expect(peekOAuthUsage("work")?.windows.find(w => w.type === "seven_day")?.utilization).toBe(0.9)
+    let fetches = 0
+    __setFetchOAuthUsageOverride(async () => { fetches++; return null })
+    const app = createTestApp()
+    const res = await post(app, {}, "weekly reserve from oauth cache")
+    expect(res.status).toBe(200)
+    expect(capturedEnvs[0]).toContain("prof-personal")
+    expect(fetches).toBe(0)
+  }, 20_000)
+
+  it("uses the weeklyReserve setting when the env var is unset", async () => {
+    delete process.env.MERIDIAN_WEEKLY_RESERVE
+    saveSettings({ weeklyReserve: { work: 20 } })
+    recordWeekly("work", 0.81)
+    const app = createTestApp()
+    const res = await post(app, {}, "weekly reserve from settings")
+    expect(res.status).toBe(200)
+    expect(capturedEnvs[0]).toContain("prof-personal")
+  }, 20_000)
+
+  it("does nothing without a reserve configured", async () => {
+    delete process.env.MERIDIAN_WEEKLY_RESERVE
+    saveSettings({ weeklyReserve: undefined })
+    recordWeekly("work", 0.99)
+    const app = createTestApp()
+    const res = await post(app, {}, "weekly reserve unconfigured")
+    expect(res.status).toBe(200)
+    expect(capturedEnvs[0]).toContain("prof-work")
+  }, 20_000)
+
+  it("still honors an explicit profile pin", async () => {
+    recordWeekly("work", 0.95)
+    const app = createTestApp()
+    const res = await post(app, { "x-meridian-profile": "work" }, "weekly reserve pinned")
+    expect(res.status).toBe(200)
+    expect(capturedEnvs[0]).toContain("prof-work")
+  }, 20_000)
+
+  it("answers 429 with the earliest reset when every profile holds its reserve", async () => {
+    process.env.MERIDIAN_WEEKLY_RESERVE = "work=20,personal=20"
+    const personalReset = Date.now() + 60 * 60_000
+    recordWeekly("work", 0.9)
+    recordWeekly("personal", 0.9, personalReset)
+    const app = createTestApp()
+    const res = await post(app, {}, "weekly reserve all held")
+    expect(res.status).toBe(429)
+    const retryAfter = Number(res.headers.get("retry-after"))
+    expect(retryAfter).toBeGreaterThan(55 * 60)
+    expect(retryAfter).toBeLessThanOrEqual(60 * 60)
+    const body = await res.json() as { error: { type: string }; retry_after?: number }
+    expect(body.error.type).toBe("rate_limit_error")
+    expect(body.retry_after).toBe(retryAfter)
+    expect(capturedEnvs).toHaveLength(0)
+  }, 20_000)
+
+  it("caps the all-held Retry-After when the earliest reset is days away", async () => {
+    process.env.MERIDIAN_WEEKLY_RESERVE = "work=20,personal=20"
+    recordWeekly("work", 0.9)
+    recordWeekly("personal", 0.9)
+    const res = await post(createTestApp(), {}, "weekly reserve capped retry")
+    expect(res.status).toBe(429)
+    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(24 * 60 * 60)
+  }, 20_000)
+
+  it("lets retain-only work keep its route when every profile is held", async () => {
+    const sessionId = "weekly-reserve-retained"
+    const app = createTestApp()
+    await assignToFallback(app, sessionId, "human-1")
+    expect(durableRoute(sessionId).profileId).toBe("personal")
+    process.env.MERIDIAN_WEEKLY_RESERVE = "work=20,personal=20"
+    recordWeekly("work", 0.9)
+    recordWeekly("personal", 0.9)
+    const res = await post(createTestApp(), unauthenticatedOpenCodeHeaders(sessionId), TOOL_CONTINUATION)
+    expect(res.status).toBe(200)
+    expect(capturedEnvs).toHaveLength(1)
+    expect(capturedEnvs[0]).toContain("prof-personal")
+  }, 20_000)
+
+  it("skips a held active profile in active+priority mode", async () => {
+    process.env.MERIDIAN_ROUTING = "active+priority"
+    recordWeekly("work", 0.9)
+    const app = createTestApp()
+    const switched = await app.fetch(new Request("http://localhost/profiles/active", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile: "work" }),
+    }))
+    expect(switched.status).toBe(200)
+    capturedEnvs = []
+    const res = await post(app, {}, "weekly reserve active held")
+    expect(res.status).toBe(200)
+    expect(capturedEnvs).toHaveLength(1)
+    expect(capturedEnvs[0]).toContain("prof-personal")
+  }, 20_000)
 })

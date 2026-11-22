@@ -14,11 +14,13 @@ import { describe, it, expect } from "bun:test"
 import {
   clientAbortDisposition,
   coalesceCompleteToolResultContinuation,
+  settlesCheckpointThenContinues,
   isMidConvoEffortSystemMessage,
   findCompleteToolResultCheckpoint,
   createEarlyStopTracker,
   allForwardedCallsResolved,
   isClientForwardedToolUse,
+  isSdkToolSearchCall,
   noteAssistantContent,
   noteAssistantMessage,
   noteUserContent,
@@ -61,6 +63,39 @@ describe("isClientForwardedToolUse", () => {
 
   it("excludes ToolSearch (internal, SDK-executed for deferred loading)", () => {
     expect(isClientForwardedToolUse(toolUse("t1", "ToolSearch"))).toBe(false)
+  })
+
+  it("treats ToolSearch as a client tool when the client owns the search", () => {
+    expect(isClientForwardedToolUse(toolUse("t1", "ToolSearch"), "mcp__oc__", true)).toBe(true)
+    // StructuredOutput stays internal in every mode.
+    expect(isClientForwardedToolUse(toolUse("t2", "StructuredOutput"), "mcp__oc__", true)).toBe(false)
+  })
+
+  // The deferred-tools note lists `mcp__oc__*` names, and a live model once
+  // called the search tool under that prefix. The CLI refuses it; forwarding it
+  // as `ToolSearch` made the client fail a tool it never declared.
+  it("excludes ToolSearch under the client prefix when the SDK owns the search", () => {
+    expect(isClientForwardedToolUse(toolUse("t1", "mcp__oc__ToolSearch"), "mcp__oc__", false, true)).toBe(false)
+    expect(isClientForwardedToolUse(toolUse("t2", "mcp__litellm__ToolSearch"), "mcp__litellm__", false, true)).toBe(false)
+    // No SDK search (nothing deferred) or a client ToolSearch: an ordinary name.
+    expect(isClientForwardedToolUse(toolUse("t3", "mcp__oc__ToolSearch"))).toBe(true)
+    expect(isClientForwardedToolUse(toolUse("t4", "mcp__oc__ToolSearch"), "mcp__oc__", true, false)).toBe(true)
+  })
+
+  it("does not arm the tracker for a prefixed SDK search, so its refusal cannot settle a checkpoint", () => {
+    const tracker = createEarlyStopTracker()
+    noteAssistantMessage(tracker, sdkAssistant("a1", [toolUse("t1", "mcp__oc__ToolSearch")]), "mcp__oc__", false, true)
+    expect(tracker.expected.size).toBe(0)
+    expect(tracker.toolCallAssistantUuid).toBeUndefined()
+  })
+
+  it("names the SDK search call in both spellings only when the SDK owns each", () => {
+    expect(isSdkToolSearchCall("ToolSearch")).toBe(true)
+    expect(isSdkToolSearchCall("ToolSearch", "mcp__oc__", true)).toBe(false)
+    expect(isSdkToolSearchCall("mcp__oc__ToolSearch")).toBe(false)
+    expect(isSdkToolSearchCall("mcp__oc__ToolSearch", "mcp__oc__", false, true)).toBe(true)
+    expect(isSdkToolSearchCall("mcp__other__ToolSearch", "mcp__oc__", false, true)).toBe(false)
+    expect(isSdkToolSearchCall("mcp__oc__read", "mcp__oc__", false, true)).toBe(false)
   })
 
   it("excludes internal MCP tools from other servers", () => {
@@ -286,6 +321,46 @@ describe("early-stop tracking", () => {
 })
 
 
+describe("settlesCheckpointThenContinues", () => {
+  const result = (id: string) => ({ type: "tool_result", tool_use_id: id, content: "ok" })
+  const partial = { role: "assistant", content: [{ type: "text", text: "The file contains" }] }
+  const next = { role: "user", content: "still there?" }
+
+  it("accepts complete results followed by an interrupted assistant turn", () => {
+    expect(settlesCheckpointThenContinues([
+      { role: "user", content: [result("t1"), result("t2")] }, partial, next,
+    ], ["t1", "t2"])).toBe(true)
+    expect(settlesCheckpointThenContinues([
+      { role: "user", content: [result("t1")] }, partial, next, { role: "user", content: "one more queued instruction" },
+    ], ["t1"])).toBe(true)
+  })
+
+  it("rejects partial or unknown results even when history moved on", () => {
+    expect(settlesCheckpointThenContinues([{ role: "user", content: [result("t1")] }, partial, next], ["t1", "t2"])).toBe(false)
+    expect(settlesCheckpointThenContinues([{ role: "user", content: [result("other")] }, partial, next], ["t1"])).toBe(false)
+  })
+
+  it("rejects a delta with no later assistant turn, which the coalescer owns", () => {
+    expect(settlesCheckpointThenContinues([{ role: "user", content: [result("t1")] }, next], ["t1"])).toBe(false)
+    expect(settlesCheckpointThenContinues([partial], ["t1"])).toBe(false)
+  })
+
+  it("rejects later unmatched or duplicate results after a settled batch", () => {
+    const settled = { role: "user", content: [result("t1")] }
+    expect(settlesCheckpointThenContinues([settled, partial, { role: "user", content: [result("unknown")] }], ["t1"])).toBe(false)
+    expect(settlesCheckpointThenContinues([settled, partial, { role: "user", content: [result("t1")] }], ["t1"])).toBe(false)
+  })
+
+  it("rejects later tool calls, reminders, and an assistant-only tail", () => {
+    const settled = { role: "user", content: [result("t1")] }
+    const newCall = { role: "assistant", content: [{ type: "tool_use", id: "t2", name: "read", input: {} }] }
+    expect(settlesCheckpointThenContinues([settled, newCall, next], ["t1"])).toBe(false)
+    expect(settlesCheckpointThenContinues([settled, partial, { role: "system", content: "reminder" }, next], ["t1"])).toBe(false)
+    expect(settlesCheckpointThenContinues([settled, partial], ["t1"])).toBe(false)
+    expect(settlesCheckpointThenContinues([settled, { role: "assistant", content: [{ type: "text", text: "  " }] }, next], ["t1"])).toBe(false)
+  })
+})
+
 describe("coalesceCompleteToolResultContinuation", () => {
   const result = (id: string, content: unknown = "ok") => ({ type: "tool_result", tool_use_id: id, content })
 
@@ -371,6 +446,84 @@ describe("coalesceCompleteToolResultContinuation", () => {
       { role: "user", content: [result("t1")] },
       { role: "assistant", content: [{ type: "text", text: "late" }] },
     ], ["t1"])).toBeUndefined()
+  })
+
+  describe("per-call echo/result pairs from a Responses-API client", () => {
+    const echo = (...ids: string[]) => ({
+      role: "assistant",
+      content: ids.map(id => ({ type: "tool_use", id, name: "read", input: {} })),
+    })
+
+    it("coalesces [echo A, result A, echo B, result B] into one settled batch", () => {
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1")] },
+        echo("t2"),
+        { role: "user", content: [result("t2"), { type: "text", text: "note" }] },
+      ], ["t1", "t2"])).toEqual([{
+        role: "user",
+        content: [result("t1"), result("t2"), { type: "text", text: "note" }],
+      }])
+    })
+
+    it("rejects pairs that leave the batch unsettled or name other calls", () => {
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1")] },
+        echo("t2"),
+      ], ["t1", "t2"])).toBeUndefined()
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1")] },
+        echo("t3"),
+        { role: "user", content: [result("t2")] },
+      ], ["t1", "t2"])).toBeUndefined()
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1")] },
+        echo("t1"),
+        { role: "user", content: [result("t2")] },
+      ], ["t1", "t2"])).toBeUndefined()
+    })
+
+    it("rejects a result that arrives before its own echo", () => {
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1"), result("t2")] },
+        echo("t2"),
+      ], ["t1", "t2"])).toBeUndefined()
+    })
+
+    it("rejects a later echo after user text or once the batch is settled", () => {
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1"), { type: "text", text: "queued" }] },
+        echo("t2"),
+        { role: "user", content: [result("t2")] },
+      ], ["t1", "t2"])).toBeUndefined()
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1")] },
+        echo("t1"),
+      ], ["t1"])).toBeUndefined()
+    })
+
+    it("rejects a later echo when the batch had no leading echo", () => {
+      expect(coalesceCompleteToolResultContinuation([
+        { role: "user", content: [result("t1")] },
+        echo("t2"),
+        { role: "user", content: [result("t2")] },
+      ], ["t1", "t2"])).toBeUndefined()
+    })
+
+    it("rejects a later echo that also carries assistant text", () => {
+      expect(coalesceCompleteToolResultContinuation([
+        echo("t1"),
+        { role: "user", content: [result("t1")] },
+        { role: "assistant", content: [{ type: "text", text: "and next" }, { type: "tool_use", id: "t2", name: "read", input: {} }] },
+        { role: "user", content: [result("t2")] },
+      ], ["t1", "t2"])).toBeUndefined()
+    })
   })
 })
 

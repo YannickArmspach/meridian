@@ -17,6 +17,7 @@ import { forgeCodeAdapter } from "./forgecode"
 import { claudeCodeAdapter } from "./claudecode"
 import { openAiAdapter } from "./openai"
 import { jcodeAdapter, normalizeJcodeSessionId } from "./jcode"
+import { lettaAdapter } from "./letta"
 import { codexAdapter } from "./codex"
 import { cherryAdapter } from "./cherry"
 import { polytokenAdapter, normalizePolytokenSessionId } from "./polytoken"
@@ -51,6 +52,11 @@ const ADAPTER_MAP: Record<string, AgentAdapter> = {
   openai: openAiAdapter,
   // Jcode uses the OpenAI-compatible endpoint with a durable local session ID.
   jcode: jcodeAdapter,
+  // Letta Code uses the OpenAI-compatible endpoint and sends no session
+  // header; its conversation id travels in an injected reminder in the body.
+  // Selected via the x-meridian-agent: letta tag the handler sets on the
+  // internal hop once it has parsed that id.
+  letta: lettaAdapter,
   // Codex CLI endpoint (/v1/responses). Forces passthrough — Codex executes
   // its own tools. Selected via the x-meridian-agent: codex internal tag.
   codex: codexAdapter,
@@ -165,10 +171,11 @@ export function detectAdapter(c: Context): AgentAdapter {
     if (inst) return inst
   }
 
-  // Polytoken's native session header is unambiguous — no other client sends
-  // it — and it beats every UA/affinity heuristic below. Identity is produced
+  // Polytoken's native conversation/session headers are unambiguous and beat
+  // every UA/affinity heuristic below. Identity is produced
   // only by the adapter itself; a UA-only match never manufactures one.
-  if (normalizePolytokenSessionId(c.req.header("x-polytoken-session"))) {
+  if (normalizePolytokenSessionId(c.req.header("x-polytoken-conversation"))
+    || normalizePolytokenSessionId(c.req.header("x-polytoken-session"))) {
     return polytokenAdapter
   }
 

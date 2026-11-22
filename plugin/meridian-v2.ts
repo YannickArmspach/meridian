@@ -117,13 +117,14 @@ export function shouldDetachFromParentSession(agent: string, _traits: AgentTrait
  */
 export function applyMeridianV2Headers(
   headers: MutableHeaders,
-  input: { sessionID: string; agent: string; traits: AgentTraits },
+  input: { sessionID: string; agent: string; traits: AgentTraits; kind?: string },
 ): void {
   for (const name of SESSION_AFFINITY_HEADERS) deleteHeader(headers, name)
   for (const name of MERIDIAN_CONTROL_HEADERS) deleteHeader(headers, name)
 
-  const name = safeAgentName(input.agent)
-  const detached = shouldDetachFromParentSession(input.agent, input.traits)
+  const oneShotKind = input.kind === "title" || input.kind === "generate" ? input.kind : undefined
+  const name = oneShotKind ?? safeAgentName(input.agent)
+  const detached = oneShotKind !== undefined || shouldDetachFromParentSession(input.agent, input.traits)
 
   if (detached) {
     setHeader(headers, "x-meridian-source", `subagent-${name}`)
@@ -133,16 +134,17 @@ export function applyMeridianV2Headers(
     setHeader(headers, "x-opencode-session", input.sessionID)
     setHeader(headers, "x-session-affinity", input.sessionID)
     setHeader(headers, "x-session-id", input.sessionID)
-    if (input.agent === ATTACHED_COMPACTION_AGENT) {
-      // Source selects the base model tier without making the adapter append
-      // `#compaction` to the primary session key.
-      setHeader(headers, "x-meridian-source", "subagent-compaction")
+    if (input.agent === ATTACHED_COMPACTION_AGENT || input.kind === "compaction") {
+      // A `fork-` source keeps the conversation's model tier (the compaction
+      // carries the history it summarizes) and, unlike an agent-mode change,
+      // does not make the adapter append `#compaction` to the primary key.
+      setHeader(headers, "x-meridian-source", "fork-compaction")
     }
   }
 
-  const internalMode = PARENT_SESSION_ONE_SHOTS.has(input.agent)
+  const internalMode = oneShotKind !== undefined || PARENT_SESSION_ONE_SHOTS.has(input.agent)
     ? "subagent"
-    : input.agent === ATTACHED_COMPACTION_AGENT ? "primary" : input.traits.mode
+    : input.agent === ATTACHED_COMPACTION_AGENT || input.kind === "compaction" ? "primary" : input.traits.mode
   setHeader(headers, "x-opencode-agent-name", name)
   setHeader(headers, "x-opencode-agent-mode", internalMode)
 }
@@ -184,6 +186,36 @@ type MeridianCatalogClient = {
     get(input: { providerID: string }): Promise<unknown>
   }
   reload(): Promise<void>
+}
+
+type StableModelEntry = {
+  name: string
+  limit: { context: number }
+  variants: Array<{ id: string; headers: Record<string, string>; body: { effort: string } }>
+}
+
+type StableModelEditor = {
+  provider: { get(providerID: string): unknown }
+  update(providerID: string, modelID: string, update: (entry: StableModelEntry) => void): void
+}
+
+type StableModelHost = {
+  model: {
+    transform(update: (editor: StableModelEditor) => void): Promise<{ dispose(): Promise<void> }>
+    reload(): Promise<void>
+  }
+  provider: MeridianCatalogClient["provider"]
+}
+
+function isStableModelHost(value: unknown): value is StableModelHost {
+  if (!isRecord(value) || !isRecord(value.model) || !isRecord(value.provider)) return false
+  return typeof value.model.transform === "function"
+    && typeof value.model.reload === "function"
+    && typeof value.provider.get === "function"
+}
+
+function requestKind(value: unknown): string | undefined {
+  return isRecord(value) && typeof value.kind === "string" ? value.kind : undefined
 }
 
 type ModelFetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>
@@ -487,10 +519,10 @@ export function resolveCatalogModels(
  * Write Meridian's advertised models over the assembled V2 catalog.
  *
  * Meridian is authoritative for what it will actually serve: the context window
- * follows the signed-in subscription (Sonnet stays 200k so a 1M turn is not
- * billed as Extra Usage), and the effort levels are the ones the proxy accepts.
- * OpenCode's built-in models.dev entries disagree — beta-18866 advertises a 1M
- * Sonnet — so an entry that already exists must be corrected, not skipped.
+ * follows the signed-in subscription (Sonnet 4.x stays 200k so a 1M turn is not
+ * billed as Extra Usage; Sonnet 5+ is natively 1M), and the effort levels are
+ * the ones the proxy accepts. OpenCode's built-in models.dev entries can
+ * disagree, so an entry that already exists must be corrected, not skipped.
  *
  * This does not overwrite user configuration. V2 layers `providers.<id>.models`
  * on top of plugin transforms, verified live on beta-18866: a configured
@@ -511,6 +543,20 @@ export function applyMeridianModels(
         headers: {},
         body: { effort },
       }))
+    })
+  }
+}
+
+function applyStableMeridianModels(
+  editor: StableModelEditor,
+  providerID: string,
+  models: readonly MeridianModel[],
+): void {
+  for (const model of models) {
+    editor.update(providerID, model.id, (entry) => {
+      entry.name = model.name
+      entry.limit.context = model.contextWindow
+      entry.variants = model.efforts.map((effort) => ({ id: effort, headers: {}, body: { effort } }))
     })
   }
 }
@@ -574,6 +620,10 @@ export function findLatestV2HumanMessageId(value: unknown): string | undefined {
 const MeridianV2Plugin = Plugin.define({
   id: "meridian",
   setup: async (context) => {
+    const stable = isStableModelHost(context) ? context : undefined
+    const catalog = stable
+      ? { provider: stable.provider, reload: () => stable.model.reload() }
+      : context.catalog
     const traitsByAgent = new Map<string, {
       expiresAt: number
       request: symbol
@@ -588,15 +638,23 @@ const MeridianV2Plugin = Plugin.define({
     // and not a catalog read (#1008).
     const cachedModels = readCatalogCache(Date.now())
 
-    registered.push(await context.catalog.transform((catalog) => {
-      for (const entry of resolveCatalogModels(catalog, discoveredModels, cachedModels)) {
-        applyMeridianModels(catalog, entry.providerID, entry.models)
-      }
-    }))
+    if (stable) {
+      registered.push(await stable.model.transform((editor) => {
+        for (const entry of resolveCatalogModels(editor, discoveredModels, cachedModels)) {
+          applyStableMeridianModels(editor, entry.providerID, entry.models)
+        }
+      }))
+    } else {
+      registered.push(await context.catalog.transform((draft) => {
+        for (const entry of resolveCatalogModels(draft, discoveredModels, cachedModels)) {
+          applyMeridianModels(draft, entry.providerID, entry.models)
+        }
+      }))
+    }
 
     const discoverModels = async () => {
       if (discoveryStarted || modelDiscoveryController.signal.aborted) return false
-      const loaded = await loadMeridianModels(context.catalog, modelDiscoveryController.signal)
+      const loaded = await loadMeridianModels(catalog, modelDiscoveryController.signal)
         .catch((): MeridianCatalogLoad => ({ configured: [], discovered: [] }))
       if (modelDiscoveryController.signal.aborted) return false
       if (loaded.configured.length === 0) {
@@ -606,7 +664,7 @@ const MeridianV2Plugin = Plugin.define({
         if (cachedModels.size > 0) {
           cachedModels.clear()
           removeCatalogCache()
-          await context.catalog.reload()
+          await catalog.reload()
         }
         return false
       }
@@ -618,14 +676,15 @@ const MeridianV2Plugin = Plugin.define({
       // Seed the next cold start before the reload, so a crash mid-reload still
       // leaves the catalog available to the following process.
       writeCatalogCache(loaded.discovered, Date.now())
-      await context.catalog.reload()
+      await catalog.reload()
       return true
     }
 
     const catalogEvents = context.event.subscribe({ signal: modelDiscoveryController.signal })
     void (async () => {
       for await (const event of catalogEvents) {
-        if (event.type !== "catalog.updated") continue
+        const eventType: string = event.type
+        if (eventType !== "catalog.updated" && eventType !== "provider.updated" && eventType !== "model.updated") continue
         if (await discoverModels()) return
       }
     })().catch(() => {})
@@ -643,9 +702,9 @@ const MeridianV2Plugin = Plugin.define({
             context.agent.get({ agentID: agent }, { signal: controller.signal }),
             LOOKUP_TIMEOUT_MS,
           )
-          const data = result?.data
+          const data: unknown = isRecord(result) && isRecord(result.data) ? result.data : result
           if (
-            !data
+            !isRecord(data)
             || (data.mode !== "primary" && data.mode !== "subagent" && data.mode !== "all")
             || typeof data.hidden !== "boolean"
           ) {
@@ -679,7 +738,7 @@ const MeridianV2Plugin = Plugin.define({
     }
 
     const apply = async (
-      input: { sessionID: string; agent: string; model: { providerID: string } },
+      input: { sessionID: string; agent: string; model: { providerID: string }; kind?: string },
       headers: MutableHeaders,
       refreshTraits = false,
     ): Promise<ResolvedAgentMetadata | undefined> => {
@@ -690,6 +749,7 @@ const MeridianV2Plugin = Plugin.define({
         sessionID: String(input.sessionID),
         agent,
         traits: metadata.traits,
+        kind: input.kind,
       })
       return metadata
     }
@@ -698,11 +758,13 @@ const MeridianV2Plugin = Plugin.define({
       input: { sessionID: string; agent: string },
       headers: MutableHeaders,
       metadata: ResolvedAgentMetadata,
+      kind: string | undefined,
     ): Promise<V2HumanTurn | undefined> => {
       const sessionID = String(input.sessionID)
       const agent = String(input.agent)
       if (
-        !metadata.authoritative
+        (kind !== undefined && kind !== "primary")
+        || !metadata.authoritative
         || metadata.exactMode !== "primary"
         || metadata.traits.hidden
         || INTERNAL_ROUTING_AGENT_IDS.has(agent)
@@ -732,18 +794,19 @@ const MeridianV2Plugin = Plugin.define({
         registered.push(await context.session.hook("model.request", async (input) => {
           // Apply lineage/tier identity early, but never emit the routing
           // attestation before the final HTTP boundary.
-          await apply(input, input.headers)
+          await apply({ ...input, kind: requestKind(input) }, input.headers)
         }, { providerID }))
         registered.push(await context.session.hook("http.request", async (input) => {
           // Re-read exact visibility/mode at the final boundary. The model-hook
           // cache is capability-only and must never authorize a stale visible
           // primary after a config reload.
-          const metadata = await apply(input, input.request.headers, true)
+          const kind = requestKind(input)
+          const metadata = await apply({ ...input, kind }, input.request.headers, true)
           if (!metadata) return
-          const humanTurn = await resolveHumanTurn(input, input.request.headers, metadata)
+          const humanTurn = await resolveHumanTurn(input, input.request.headers, metadata, kind)
           if (!humanTurn) return
           const token = createPriorityAttestation({
-            generation: "oc2b18314",
+            generation: stable ? "oc2v2016" : "oc2b18314",
             sessionId: String(input.sessionID),
             agentId: String(input.agent),
             humanMessageId: humanTurn.id,

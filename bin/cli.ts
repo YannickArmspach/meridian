@@ -16,7 +16,7 @@ if (args.includes("--version") || args.includes("-v")) {
   process.exit(0)
 }
 
-if (args.includes("--help") || args.includes("-h")) {
+if ((args.includes("--help") || args.includes("-h")) && args[0] !== "chatgpt-migrate" && args[0] !== "instance-import") {
   console.log(`meridian v${version}
 
 Local API bridge for Claude and Antigravity subscriptions.
@@ -27,20 +27,29 @@ Commands:
   (default)        Start the proxy server
   status           Show what a running instance is doing (the / page, in the terminal)
   setup            Configure client integrations (run once after install)
-  profile          Manage Claude account profiles (add, list, switch, remove)
+  profile          Manage Claude account profiles and ChatGPT seats (add, list, switch, remove)
   refresh-token    Refresh the Claude Code OAuth token
+  chatgpt-migrate  Move ChatGPT accounts from oc-codex-multi-auth into Meridian, or back with --reverse (--help)
+  instance-import  Move one Meridian instance's ChatGPT seats and their history into another (--help)
+  test-error-report  Crash with a test error to check error reporting reaches the collector
 
-Setup options:
-  --antigravity                Configure Pi or OpenCode V1 for Antigravity
-  --client <pi|opencode>       Client to configure with --antigravity
-  --url <base URL>             Antigravity URL (include /antigravity in combined mode)
-  --model <account slug>      Account model to add
-  --config-dir <directory>    Optional client configuration directory
-  --api-key-env <variable>    Reference a local Meridian API key from the environment
-  --set-default              Also select Antigravity for the client
-  --v1                         Install the OpenCode V1 plugin
-  --v2                         Install the pinned OpenCode V2 beta plugin
-  --opencode-bin <executable>  Probe this OpenCode executable
+Setup:
+  meridian setup [--client opencode|pi] [options]
+  Install Meridian's integration for a client. Run again after upgrading Meridian.
+
+  --client <opencode|pi>        Client to set up (default: opencode)
+
+  OpenCode:
+    --v1, --v2                  Install the V1 plugin or the pinned V2 beta plugin (default: detect)
+    --opencode-bin <path>       OpenCode executable to detect the version from
+
+  Antigravity (Pi, or OpenCode V1), instead of the Claude integration:
+    --antigravity               Add an Antigravity model to the client
+    --url <base URL>            Antigravity URL (include /antigravity in combined mode)
+    --model <account slug>      Account model to add
+    --config-dir <directory>    Client configuration directory (default: the client's own)
+    --api-key-env <variable>    Read the Meridian API key from this environment variable
+    --set-default               Also make it the client's default model
 
 Options:
   -v, --version   Show version
@@ -65,8 +74,9 @@ Environment variables:
   MERIDIAN_PASSTHROUGH              Enable passthrough mode (tools forwarded to client)
   MERIDIAN_IDLE_TIMEOUT_SECONDS     Idle timeout in seconds (default: 120)
   MERIDIAN_IDLE_EXIT_SECONDS        Exit after this many seconds without a model request (opt-in)
-  MERIDIAN_PLUGIN_DIR               Plugin auto-discovery directory (default: ~/.config/meridian/plugins)
-  MERIDIAN_PLUGIN_CONFIG            Plugin manifest path (default: ~/.config/meridian/plugins.json)
+  MERIDIAN_PLUGIN_DIR               Plugin auto-discovery directory (default: <config dir>/plugins)
+  MERIDIAN_PLUGIN_CONFIG            Plugin manifest path (default: <config dir>/plugins.json)
+  MERIDIAN_ERROR_REPORTING_DSN      Report Meridian's own crashes to this GlitchTip/Sentry DSN (off when unset)
 
 See https://github.com/rynfar/meridian for full documentation.`)
   process.exit(0)
@@ -77,6 +87,7 @@ if (args[0] === "profile") {
   const subcommand = args[1]
   const profileId = args[2]
   const headless = args.includes("--headless")
+  const chatgpt = args.includes("--chatgpt")
 
   if (subcommand === "add" && profileId) {
     const oauthFlagIdx = args.indexOf("--oauth-token", 3)
@@ -84,14 +95,14 @@ if (args[0] === "profile") {
       const tokenArg = args[oauthFlagIdx + 1]
       await profileAddOauthToken(profileId, tokenArg?.startsWith("--") ? undefined : tokenArg)
     } else {
-      await profileAdd(profileId, { headless })
+      await profileAdd(profileId, { headless, chatgpt })
     }
   }
-  else if (subcommand === "list" || subcommand === "ls") profileList()
-  else if (subcommand === "remove" && profileId) profileRemove(profileId)
-  else if (subcommand === "rename" && profileId && args[3]) profileRename(profileId, args[3])
+  else if (subcommand === "list" || subcommand === "ls") await profileList()
+  else if (subcommand === "remove" && profileId) await profileRemove(profileId)
+  else if (subcommand === "rename" && profileId && args[3]) await profileRename(profileId, args[3])
   else if (subcommand === "switch" && profileId) await profileSwitch(profileId)
-  else if (subcommand === "login" && profileId) await profileLogin(profileId, { headless })
+  else if (subcommand === "login" && profileId) await profileLogin(profileId, { headless, chatgpt })
   else profileHelp()
   process.exit(0)
 }
@@ -110,6 +121,58 @@ if (args[0] === "setup" && args.includes("--antigravity")) {
     console.error(error instanceof Error ? error.message : String(error))
     process.exit(1)
   }
+}
+
+let setupClient: "opencode" | "pi" | undefined
+if (args[0] === "setup") {
+  const clientIndex = args.indexOf("--client")
+  const inlineClient = args.find(arg => arg.startsWith("--client="))
+  const client = inlineClient !== undefined
+    ? inlineClient.slice("--client=".length)
+    : clientIndex >= 0 ? args[clientIndex + 1] : "opencode"
+  if (client !== "opencode" && client !== "pi") {
+    console.error("Choose --client opencode or --client pi")
+    process.exit(1)
+  }
+  if (client === "pi" && ["--v1", "--v2", "--opencode-bin"].some(flag => args.includes(flag))) {
+    console.error("--v1, --v2 and --opencode-bin only apply to --client opencode")
+    process.exit(1)
+  }
+  setupClient = client
+}
+
+if (setupClient === "pi") {
+  const {
+    assertSupportedPiVersion,
+    detectPiVersion,
+    findPluginRoot,
+    installPiExtension,
+    UnsupportedPiVersionError,
+  } = await import("../src/proxy/piSetup")
+  const piVersion = detectPiVersion()
+  try {
+    assertSupportedPiVersion(piVersion)
+  } catch (err) {
+    if (err instanceof UnsupportedPiVersionError) {
+      console.error(`\x1b[31m✗ ${err.message}\x1b[0m`)
+      console.error("  Upgrade with: npm install -g @earendil-works/pi-coding-agent")
+      console.error("  Older Pi releases can still use the models.json setup in docs/agents.md.")
+      process.exit(1)
+    }
+    throw err
+  }
+  if (!piVersion) {
+    console.error("\x1b[33m⚠ Could not run 'pi --version'; installing anyway. The extension requires Pi 1.0 or newer.\x1b[0m")
+  }
+  const result = installPiExtension(findPluginRoot(import.meta.url))
+  console.log(`\x1b[32m✓ Meridian extension ${result.replaced && !result.backupPath ? "updated" : "installed"} for Pi${piVersion ? ` ${piVersion}` : ""}\x1b[0m`)
+  console.log(`  Extension: ${result.extensionPath}`)
+  if (result.backupPath) console.log(`  Backup: ${result.backupPath} (the directory that was there was not Meridian's)`)
+  console.log("\nRestart Pi or run /reload, then pick a model under the meridian provider with /model.")
+  console.log("On a Claude subscription, Claude may refuse Pi's system prompt as third-party traffic unless")
+  console.log("Meridian also loads the @rynfar/meridian-plugin-pi-scrub server plugin:")
+  console.log("https://github.com/rynfar/meridian/blob/main/docs/plugins.md#official-plugins")
+  process.exit(0)
 }
 
 if (args[0] === "setup") {
@@ -151,12 +214,12 @@ if (args[0] === "setup") {
     process.exit(1)
   }
   if (forceV2 && detected.generation !== "v2") {
-    console.error("Could not find an OpenCode V2 beta. Install the pinned beta or pass --opencode-bin <path>.")
+    console.error("Could not find a qualified OpenCode V2 host. Install a supported version or pass --opencode-bin <path>.")
     process.exit(1)
   }
   if (detected.generation === "v2" && !SUPPORTED_OPENCODE_V2_VERSIONS.has(detected.version ?? "")) {
     console.error(`OpenCode V2 ${detected.version ?? "unknown"} is not supported by this Meridian build.`)
-    console.error(`Install a supported OpenCode beta (${[...SUPPORTED_OPENCODE_V2_VERSIONS].join(", ")}), then re-run meridian setup --v2.`)
+    console.error(`Install a qualified OpenCode V2 host (${[...SUPPORTED_OPENCODE_V2_VERSIONS].join(", ")}), then re-run meridian setup --v2.`)
     process.exit(1)
   }
 
@@ -211,6 +274,16 @@ if (args[0] === "setup") {
   process.exit(0)
 }
 
+if (args[0] === "chatgpt-migrate") {
+  const { runMigrateCli } = await import("../src/proxy/chatgpt/migrate/cli")
+  process.exit(await runMigrateCli(args.slice(1)))
+}
+
+if (args[0] === "instance-import") {
+  const { runInstanceImportCli } = await import("../src/proxy/instanceImport/cli")
+  process.exit(await runInstanceImportCli(args.slice(1)))
+}
+
 if (args[0] === "refresh-token") {
   const { refreshOAuthToken } = await import("../src/proxy/tokenRefresh")
   const success = await refreshOAuthToken()
@@ -221,6 +294,19 @@ if (args[0] === "refresh-token") {
     console.error("Token refresh failed. If the problem persists, run: claude login")
     process.exit(1)
   }
+}
+
+if (args[0] === "test-error-report") {
+  const { installErrorReporter } = await import("../src/errorReporting")
+  if (!installErrorReporter({ version })) {
+    console.error("Error reporting is off. Set MERIDIAN_ERROR_REPORTING_DSN, or errorReportingDsn in settings.json.")
+    process.exit(1)
+  }
+  console.error("Crashing on purpose with a test error; the configured collector receives it within seconds.")
+  // Thrown at top level rather than from a timer held open by a pending
+  // top-level await: Bun does not exit on an uncaught timer exception while a
+  // top-level await is outstanding, so that form would hang instead of crash.
+  throw new Error("Meridian error-reporting test (meridian test-error-report)")
 }
 
 const exec = promisify(execCallback)
@@ -302,6 +388,11 @@ export async function runCli(
     return execFile(claudePath, ["auth", "status"], { timeout: 5000 })
   }
 ) {
+  // First, so a failure anywhere in startup is reported too. Off unless an
+  // error-reporting DSN is configured; see src/errorReporting/index.ts.
+  const { installErrorReporter } = await import("../src/errorReporting")
+  installErrorReporter({ version })
+
   if (process.env.MERIDIAN_BACKEND !== "antigravity") {
     // Plugin check — warn if OpenCode config exists but meridian plugin is missing
     try {
@@ -317,27 +408,42 @@ export async function runCli(
       }
     } catch { /* non-fatal */ }
 
-    // Pre-flight auth check — runs the resolved Claude binary's auth-status
-    // subcommand. Independent of whether `claude` is on PATH (#478).
+    // Pi check — warn if Pi is installed but the Meridian extension is missing or stale
     try {
-      const { stdout } = await runAuthCheck()
-      const auth = JSON.parse(stdout)
-      if (!auth.loggedIn) {
-        console.error("\x1b[31m✗ Not logged in to Claude.\x1b[0m Run: claude login")
-        process.exit(1)
+      const { findPluginRoot, piStartupWarning } = await import("../src/proxy/piSetup")
+      const warning = piStartupWarning(findPluginRoot(import.meta.url))
+      if (warning) {
+        const [headline, ...details] = warning
+        console.error(`\x1b[33m${headline}\x1b[0m`)
+        for (const line of details) console.error(line)
+        console.error("")
       }
-      if (auth.subscriptionType !== "max") {
-        console.error(`\x1b[33m⚠ Claude subscription: ${auth.subscriptionType || "unknown"} (Max recommended)\x1b[0m`)
-      }
-    } catch {
-      console.error("\x1b[33m⚠ Could not verify Claude auth status. If requests fail, run: claude login\x1b[0m")
-    }
+    } catch { /* non-fatal */ }
 
     // Enable disk auto-discovery when no MERIDIAN_PROFILES env var is set.
     // This lets `meridian profile add` work without restarting the server.
     if (!profiles) {
       const { enableDiskProfileDiscovery } = await import("../src/proxy/profiles")
       enableDiskProfileDiscovery()
+    }
+
+    // Pre-flight auth check — runs the resolved Claude binary's auth-status
+    // subcommand. Independent of whether `claude` is on PATH (#478).
+    const { usesDefaultAuthContext } = await import("../src/proxy/profiles")
+    if (usesDefaultAuthContext(profiles, defaultProfile)) {
+      try {
+        const { stdout } = await runAuthCheck()
+        const auth = JSON.parse(stdout)
+        if (!auth.loggedIn) {
+          console.error("\x1b[31m✗ Not logged in to Claude.\x1b[0m Run: claude login")
+          process.exit(1)
+        }
+        if (auth.subscriptionType !== "max") {
+          console.error(`\x1b[33m⚠ Claude subscription: ${auth.subscriptionType || "unknown"} (Max recommended)\x1b[0m`)
+        }
+      } catch {
+        console.error("\x1b[33m⚠ Could not verify Claude auth status. If requests fail, run: claude login\x1b[0m")
+      }
     }
   }
 

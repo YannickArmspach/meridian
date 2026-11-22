@@ -72,6 +72,8 @@ installMcpToolsMock(() => ({
 }))
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
+const { telemetryStore } = await import("../telemetry")
+const { computeCostEstimate } = await import("../telemetry/pricing")
 
 function createTestApp() {
   // Force internal mode globally — the codex adapter must override it to
@@ -94,8 +96,8 @@ function postResponses(app: any, body: any) {
 }
 
 describe("/v1/responses (#475)", () => {
-  beforeEach(() => {
-    clearSessionCache()
+  beforeEach(async () => {
+    await clearSessionCache()
     capturedOptions = []
   })
 
@@ -197,8 +199,8 @@ describe("/v1/responses (#475)", () => {
 })
 
 describe("/v1/responses session continuity via prompt_cache_key (#655)", () => {
-  beforeEach(() => {
-    clearSessionCache()
+  beforeEach(async () => {
+    await clearSessionCache()
     capturedOptions = []
   })
 
@@ -245,8 +247,8 @@ describe("/v1/responses session continuity via prompt_cache_key (#655)", () => {
 })
 
 describe("/v1/responses keeps a spawned Codex thread out of its parent's session", () => {
-  beforeEach(() => {
-    clearSessionCache()
+  beforeEach(async () => {
+    await clearSessionCache()
     capturedOptions = []
   })
 
@@ -318,5 +320,24 @@ describe("/v1/responses keeps a spawned Codex thread out of its parent's session
     await postResponses(app, body([userItem]))
     await postResponses(app, body(loopTurnInput))
     expect(capturedOptions[1].resume).toBe(capturedOptions[0].sessionId)
+  })
+})
+
+describe("/v1/responses cost estimate for GPT model ids", () => {
+  beforeEach(async () => {
+    await clearSessionCache()
+    telemetryStore.clear()
+  })
+
+  it("leaves a GPT id that Claude answered unpriced", async () => {
+    const app = createTestApp()
+    const res = await postResponses(app, { model: "gpt-5.5", input: "hi", stream: false })
+    expect(res.status).toBe(200)
+    const metric = telemetryStore.getRecent({ limit: 10 }).find(m => m.requestModel === "gpt-5.5")
+    expect(metric).toBeDefined()
+    expect(metric!.model.startsWith("gpt-")).toBe(false)
+    const estimate = computeCostEstimate([metric!])
+    expect(estimate.byModel["gpt-5.5"]!.estimatedUsd).toBeNull()
+    expect(estimate.unpricedRequestCount).toBe(1)
   })
 })

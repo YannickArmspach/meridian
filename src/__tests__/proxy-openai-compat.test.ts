@@ -11,7 +11,7 @@
  *   4. Existing /v1/messages behavior is unaffected (no regressions)
  */
 
-import { describe, it, expect, mock, beforeEach } from "bun:test"
+import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
@@ -74,10 +74,20 @@ installMcpToolsMock(() => ({
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { REPLAY_PROVENANCE_NOTE, SCRATCHPAD_COUNTER_INSTRUCTION, buildNoClientCwdNote } = await import("../proxy/query")
 
+const testProxies: ReturnType<typeof createProxyServer>[] = []
+
 function createTestApp() {
-  const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
-  return app
+  const proxy = createProxyServer({ port: 0, host: "127.0.0.1" })
+  testProxies.push(proxy)
+  return proxy.app
 }
+
+afterEach(async () => {
+  for (const proxy of testProxies.splice(0)) {
+    if (!proxy.closeBackend) throw new Error("HTTP fixture must expose joined backend cleanup")
+    await proxy.closeBackend()
+  }
+})
 
 async function postChatCompletion(
   app: ReturnType<typeof createTestApp>,
@@ -96,10 +106,10 @@ async function postChatCompletion(
 // ---------------------------------------------------------------------------
 
 describe("POST /v1/chat/completions — non-streaming", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = []
     capturedPromptMessages = []
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   it("returns OpenAI completion shape for a simple message", async () => {
@@ -385,6 +395,35 @@ describe("POST /v1/chat/completions — non-streaming", () => {
       parent_tool_use_id: null,
     }])
   })
+
+  it("preserves base64 PDF file parts as document blocks for the SDK prompt", async () => {
+    mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
+    const app = createTestApp()
+
+    const res = await postChatCompletion(app, {
+      stream: false,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "summarize this" },
+          { type: "file", file: { filename: "report.pdf", file_data: "data:application/pdf;base64,JVBERi0x" } },
+        ],
+      }],
+    })
+
+    expect(res.status).toBe(200)
+    expect(capturedPromptMessages).toEqual([{
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "summarize this" },
+          { type: "document", title: "report.pdf", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0x" } },
+        ],
+      },
+      parent_tool_use_id: null,
+    }])
+  })
 })
 
 describe("POST /v1/chat/completions — Jcode session continuity", () => {
@@ -405,12 +444,12 @@ describe("POST /v1/chat/completions — Jcode session continuity", () => {
     ],
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
     capturedPromptMessages = []
     capturedOptions = null
     capturedOptionHistory = []
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   it("resumes the same SDK session for two turns with one verified Jcode key", async () => {
@@ -514,17 +553,18 @@ describe("POST /v1/chat/completions — session-keyed continuity for the generic
     return innerRequests
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
     capturedPromptMessages = []
     capturedOptions = null
     capturedOptionHistory = []
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   for (const [headerName, keyValue] of [
     ["x-session-affinity", "affinity-session-a"],
     ["x-opencode-session", "opencode-session-a"],
+    ["x-session-id", "generic-session-a"],
   ] as const) {
     it(`keeps the real messages and resumes across turns keyed by ${headerName}`, async () => {
       const app = createTestApp()
@@ -557,14 +597,53 @@ describe("POST /v1/chat/completions — session-keyed continuity for the generic
     })
   }
 
-  it("keeps distinct generic session keys isolated", async () => {
+  for (const headerName of ["x-session-affinity", "x-session-id"]) it(`keeps distinct ${headerName} conversations isolated`, async () => {
     const app = createTestApp()
 
-    await postChatCompletion(app, firstTurn, { "x-session-affinity": "session-a" })
-    await postChatCompletion(app, secondTurn, { "x-session-affinity": "session-b" })
+    expect((await postChatCompletion(app, firstTurn, { [headerName]: "session-a" })).status).toBe(200)
+    expect((await postChatCompletion(app, secondTurn, { [headerName]: "session-b" })).status).toBe(200)
 
     expect(capturedOptionHistory).toHaveLength(2)
     expect(capturedOptionHistory[1]?.resume).toBeUndefined()
+    expect(capturedOptionHistory[1]?.sessionId).not.toBe(capturedOptionHistory[0]?.sessionId)
+  })
+
+  for (const legacyHeader of ["x-opencode-session", "x-session-affinity"]) it(`preserves ${legacyHeader} identity when x-session-id changes`, async () => {
+    const app = createTestApp()
+    const innerRequests = captureInnerRequests(app)
+
+    expect((await postChatCompletion(app, firstTurn, { [legacyHeader]: "legacy-key", "x-session-id": "generic-a" })).status).toBe(200)
+    expect((await postChatCompletion(app, secondTurn, { [legacyHeader]: "legacy-key", "x-session-id": "generic-b" })).status).toBe(200)
+
+    expect(capturedOptionHistory).toHaveLength(2)
+    expect(capturedOptionHistory[1]?.resume).toBe(capturedOptionHistory[0]?.sessionId)
+    expect(innerRequests[1]?.headers.get(legacyHeader)).toBe("legacy-key")
+    expect(innerRequests[1]?.headers.get("x-session-id")).toBe("generic-b")
+  })
+
+  it("keeps blank x-session-id requests on the packed path", async () => {
+    const app = createTestApp()
+    expect((await postChatCompletion(app, firstTurn, { "x-session-id": " " })).status).toBe(200)
+    expect((await postChatCompletion(app, secondTurn, { "x-session-id": "\t" })).status).toBe(200)
+
+    expect(capturedOptionHistory).toHaveLength(2)
+    expect(capturedOptionHistory[1]?.resume).toBeUndefined()
+    expect(capturedOptionHistory[1]?.systemPrompt).toContain("<conversation_history>")
+  })
+
+  it("permits the session header in the existing browser preflight", async () => {
+    const app = createTestApp()
+    const response = await app.fetch(new Request("http://localhost/v1/chat/completions", {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://example.com",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type,x-session-id",
+      },
+    }))
+
+    expect(response.status).toBe(204)
+    expect(response.headers.get("access-control-allow-headers")?.toLowerCase().split(/\s*,\s*/)).toContain("x-session-id")
   })
 
   it("packs history for an unkeyed generic request", async () => {
@@ -623,9 +702,9 @@ describe("POST /v1/chat/completions — session-keyed continuity for the generic
 
   // Guards the contract, not the change: a retry must never resume and
   // double-append the same turn onto the stored session.
-  it("replays fresh when a keyed turn is retried with an identical body", async () => {
+  for (const headerName of ["x-session-affinity", "x-session-id"]) it(`replays fresh when a ${headerName} turn is retried with an identical body`, async () => {
     const app = createTestApp()
-    const headers = { "x-session-affinity": "retry-key" }
+    const headers = { [headerName]: "retry-key" }
 
     await postChatCompletion(app, firstTurn, headers)
     await postChatCompletion(app, secondTurn, headers)
@@ -642,10 +721,10 @@ describe("POST /v1/chat/completions — session-keyed continuity for the generic
 // ---------------------------------------------------------------------------
 
 describe("POST /v1/chat/completions — streaming", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = []
     capturedPromptMessages = []
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   async function readStream(res: Response): Promise<string> {
@@ -895,6 +974,56 @@ describe("POST /v1/chat/completions — streaming", () => {
     expect(text).toContain("data: [DONE]")
   })
 
+  it("forwards a mid-stream error instead of reporting only a length finish", async () => {
+    // A turn that fails after message_start is closed with a max_tokens
+    // message_delta followed by an error event (see terminateFailedStream).
+    // Dropping the error left OpenAI clients with finish_reason "length", so
+    // an upstream refusal looked like truncation and clients that continue
+    // truncated turns resent the refused request.
+    const app = createTestApp()
+    const originalFetch = app.fetch.bind(app)
+    const refusal = "API Error: safeguards flagged this message."
+    const internalFrames = [
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], model: "claude-sonnet-5", stop_reason: null, usage: { input_tokens: 10, output_tokens: 0 } } })}`,
+      `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}`,
+      `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Partial" } })}`,
+      `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}`,
+      `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "max_tokens", stop_sequence: null }, usage: { output_tokens: 3 } })}`,
+      `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: refusal } })}`,
+      `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}`,
+    ]
+    app.fetch = (req, env, executionCtx) => {
+      if (req.url === "http://internal/v1/messages") {
+        return Promise.resolve(new Response(`${internalFrames.join("\n\n")}\n\n`, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        }))
+      }
+      return originalFetch(req, env, executionCtx)
+    }
+
+    const res = await postChatCompletion(app, {
+      stream: true,
+      messages: [{ role: "user", content: "Hi" }],
+    })
+
+    const frames = (await readStream(res)).split("\n")
+      .filter(l => l.startsWith("data: ") && l !== "data: [DONE]")
+      .map(l => JSON.parse(l.slice(6)) as Record<string, unknown>)
+    const errorIndex = frames.findIndex(frame => frame.error !== undefined)
+    expect(errorIndex).toBeGreaterThan(-1)
+    expect(frames[errorIndex]!.error).toEqual({
+      type: "invalid_request_error",
+      code: "invalid_request_error",
+      message: refusal,
+    })
+    // The error must reach the client after the length finish it qualifies.
+    const lengthIndex = frames.findIndex(frame =>
+      (frame.choices as Array<{ finish_reason?: string }> | undefined)?.[0]?.finish_reason === "length")
+    expect(lengthIndex).toBeGreaterThan(-1)
+    expect(errorIndex).toBeGreaterThan(lengthIndex)
+  })
+
   // --- tool_call_counter increment behavior ---
 
   type DeltaToolCall = {
@@ -988,6 +1117,49 @@ describe("POST /v1/chat/completions — streaming", () => {
       )
     expect(argChunks.map(a => a.index)).toEqual([0, 1, 2])
     expect(argChunks.map(a => a.function!.arguments)).toEqual(['{"x":1}', '{"y":2}', '{"z":3}'])
+  })
+
+  it("keeps each tool's arguments on its own call when they arrive after a later tool starts", async () => {
+    // Fragments for block 0 arrive after block 1 has started. Routing by the
+    // most recently started tool concatenates both inputs onto the second call
+    // ({"path":"a.txt"}{"path":"b.txt"}) and leaves the first call empty.
+    mockMessages = [
+      messageStart("msg_1"),
+      toolUseBlockStart(0, "read", "tu_a"),
+      toolUseBlockStart(1, "read", "tu_b"),
+      inputJsonDelta(0, '{"path":'),
+      inputJsonDelta(1, '{"path":"b.txt"}'),
+      inputJsonDelta(0, '"a.txt"}'),
+      blockStop(0),
+      blockStop(1),
+      messageDelta("tool_use"),
+      messageStop(),
+    ]
+    const app = createTestApp()
+
+    const res = await postChatCompletion(app, {
+      stream: true,
+      messages: [{ role: "user", content: "read a and b" }],
+    })
+
+    const calls = new Map<number, { id?: string; arguments: string }>()
+    for (const chunk of streamChunks(await readStream(res))) {
+      for (const tc of chunk.choices[0]?.delta.tool_calls ?? []) {
+        if (tc.index === undefined) continue
+        const call = calls.get(tc.index) ?? { arguments: "" }
+        if (tc.id) call.id = tc.id
+        call.arguments += tc.function?.arguments ?? ""
+        calls.set(tc.index, call)
+      }
+    }
+    const assembled = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => ({
+      id: call.id,
+      input: JSON.parse(call.arguments),
+    }))
+    expect(assembled).toEqual([
+      { id: "tu_a", input: { path: "a.txt" } },
+      { id: "tu_b", input: { path: "b.txt" } },
+    ])
   })
 
   it("text-then-tool stream: tool indexes start at 0 (not affected by preceding text block)", async () => {
@@ -1104,9 +1276,9 @@ describe("GET /v1/models", () => {
 // ---------------------------------------------------------------------------
 
 describe("Regression: /v1/messages unaffected", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mockMessages = []
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   it("still returns Anthropic format from /v1/messages", async () => {
@@ -1151,12 +1323,12 @@ describe("POST /v1/chat/completions — MERIDIAN_API_KEY auth forwarding (#415)"
   const TEST_KEY = "test-key-415"
   let savedKey: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     savedKey = process.env.MERIDIAN_API_KEY
     process.env.MERIDIAN_API_KEY = TEST_KEY
     mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
     capturedPromptMessages = []
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   // Manual restore — bun:test's afterEach isn't imported in this file's other suites,

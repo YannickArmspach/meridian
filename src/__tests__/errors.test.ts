@@ -2,12 +2,38 @@
  * Unit tests for classifyError — pure function, no mocks needed.
  */
 import { describe, it, expect } from "bun:test"
-import { canRecoverCapturedToolUses, classifyError, extendedContextHint, classifyResumeRefusal, isBusySessionError, isExtraUsageRequiredError, extractSdkTermination, formatSdkTermination, isAccountFailoverError, isQuotaRefusal, isRateLimitError } from "../proxy/errors"
+import { assistantRefusalOf, canRecoverCapturedToolUses, classifyError, extendedContextHint, classifyResumeRefusal, isBusySessionError, isExtraUsageRequiredError, extractSdkTermination, formatSdkTermination, isAccountFailoverError, isQuotaRefusal, isRateLimitError } from "../proxy/errors"
+
+describe("assistantRefusalOf", () => {
+  const details = { type: "refusal", category: "cyber" }
+
+  it("keeps the structured details of a refusal row", () => {
+    expect(assistantRefusalOf({ message: { stop_reason: "refusal", stop_details: details } }))
+      .toEqual({ stopDetails: details })
+  })
+
+  it("tolerates a refusal without details", () => {
+    expect(assistantRefusalOf({ message: { stop_reason: "refusal" } })).toEqual({ stopDetails: null })
+    expect(assistantRefusalOf({ message: { stop_reason: "refusal", stop_details: "text" } })).toEqual({ stopDetails: null })
+  })
+
+  it("ignores other stops and subagent refusals", () => {
+    expect(assistantRefusalOf({ message: { stop_reason: "end_turn" } })).toBeNull()
+    expect(assistantRefusalOf({ message: { stop_reason: null } })).toBeNull()
+    expect(assistantRefusalOf({ parent_tool_use_id: "toolu_1", message: { stop_reason: "refusal", stop_details: details } })).toBeNull()
+  })
+})
 
 describe("classifyError", () => {
   describe("authentication errors", () => {
     it("detects 401 status codes", () => {
       const result = classifyError("API Error: 401 authentication_error")
+      expect(result.status).toBe(401)
+      expect(result.type).toBe("authentication_error")
+    })
+
+    it("detects the bare access-token wording as an expired login", () => {
+      const result = classifyError("OAuth access token has expired")
       expect(result.status).toBe(401)
       expect(result.type).toBe("authentication_error")
     })
@@ -168,6 +194,63 @@ describe("classifyError", () => {
       expect(r.type).toBe("billing_error")
     })
 
+    // The generic "subscription issue" text sent operators looking at an
+    // account that was fine: the refusal is about which pool the request was
+    // charged to, and only Anthropic's own sentence says which.
+    it("keeps Anthropic's own sentence for an extra-usage refusal instead of blaming the subscription", () => {
+      const r = classifyError("Claude Code returned an error result: API Error: 400 Third-party apps now draw from extra usage, not plan limits. Ask your workspace admin to add more and keep going.")
+      expect(r.status).toBe(402)
+      expect(r.type).toBe("billing_error")
+      expect(r.message).toContain("Third-party apps now draw from extra usage, not plan limits. Ask your workspace admin to add more and keep going.")
+      expect(r.message).not.toContain("API Error")
+      expect(r.message).not.toContain("subscription issue")
+    })
+
+    it("keeps the subscription advice for a lapsed subscription", () => {
+      const r = classifyError("Your subscription has expired")
+      expect(r.type).toBe("billing_error")
+      expect(r.message).toContain("subscription")
+    })
+
+    it.each([
+      "Your subscription has expired\nTool output: historical request draws from extra usage; private-context=fixture-canary",
+      "Tool output: historical request draws from extra usage; private-context=fixture-canary\nYour subscription has expired",
+    ])("does not use unrelated context as the provider's billing refusal (%s)", (message) => {
+      const r = classifyError(message)
+      expect(r.status).toBe(402)
+      expect(r.type).toBe("billing_error")
+      expect(r.message).toContain("Check your subscription status")
+      expect(r.message).not.toContain("fixture-canary")
+      expect(r.message).not.toContain("not a lapsed subscription")
+    })
+
+    it("quotes the primary provider refusal without following tool context", () => {
+      const r = classifyError("Claude Code returned an error result: API Error: 400 You're out of extra usage.\nTool output: request draws from extra usage; private-context=fixture-canary")
+      expect(r.message).toContain("You're out of extra usage.")
+      expect(r.message).not.toContain("fixture-canary")
+      expect(r.message).not.toContain("plan's own limits did not cover")
+      expect(r.message).not.toContain("not a lapsed subscription")
+    })
+
+    it.each([
+      "Error: API Error: 400 You are out of extra usage.",
+      "Claude Code returned an error result:\r\nAPI Error:\r\n400 You're out of extra usage.",
+    ])("recognizes a primary extra-usage refusal through wrappers (%s)", (message) => {
+      const r = classifyError(message)
+      expect(r.status).toBe(402)
+      expect(r.type).toBe("billing_error")
+      expect(r.message).toContain("out of extra usage.")
+      expect(r.message).not.toContain("API Error")
+    })
+
+    it("bounds the recognized primary provider refusal", () => {
+      const r = classifyError("API Error: 400 You're out of extra usage. " + "x".repeat(400) + "tail-canary")
+      expect(r.type).toBe("billing_error")
+      expect(r.message).toContain("You're out of extra usage.")
+      expect(r.message).toContain("…")
+      expect(r.message).not.toContain("tail-canary")
+    })
+
     // These used to classify as billing because the branch matched bare
     // substrings anywhere in the text, and it runs before the crash/max-turns
     // branches so it won. Harmless as a wrong status code; not harmless once
@@ -261,6 +344,21 @@ describe("classifyError", () => {
   })
 
   describe("context overflow", () => {
+    it.each([
+      "Claude Code returned an error result: Prompt is too long",
+      "input length and `max_tokens` exceed context limit: 197000 + 8192 > 200000",
+      "context_length_exceeded",
+    ])("keeps a client-recognizable overflow signal for %s", (message) => {
+      const error = classifyError(message)
+      // OpenCode recognizes Anthropic's canonical phrase to trigger reactive
+      // compaction. A generic invalid_request_error with reworded prose cannot
+      // distinguish overflow from an invalid tool schema or another bad input.
+      expect(error.message).toMatch(/prompt is too long/i)
+      expect(error.message).toMatch(/compact or trim/i)
+      expect(error.status).toBe(400)
+      expect(error.type).toBe("invalid_request_error")
+    })
+
     it("classifies the CLI's bare wording", () => {
       const r = classifyError("Claude Code returned an error result: Prompt is too long")
       expect(r.status).toBe(400)
@@ -398,11 +496,51 @@ describe("classifyError", () => {
   })
 
   describe("process crashes", () => {
+    for (const code of [143, 137]) {
+      for (const suffix of ["", "\nSubprocess stderr: worker stopped", "\nSubprocess stderr: oauth worker stopped"]) {
+        it(`classifies signal exit ${code} with ${JSON.stringify(suffix)} as transient`, () => {
+          const result = classifyError(`Claude Code process exited with code ${code}${suffix}`)
+          expect(result.status).toBe(503)
+          expect(result.type).toBe("api_error")
+          expect(result.message).toMatch(/service temporarily unavailable/i)
+          expect(result.message).toContain(String(code))
+          expect(result.message).not.toContain("claude login")
+          expect(isAccountFailoverError(result.type)).toBe(false)
+        })
+      }
+    }
+
+    for (const signal of ["SIGTERM", "SIGKILL"]) {
+      it(`classifies null-code termination by ${signal} as transient`, () => {
+        const result = classifyError(`Claude Code process terminated by signal ${signal}`)
+        expect(result.status).toBe(503)
+        expect(result.type).toBe("api_error")
+        expect(result.message).toMatch(/service temporarily unavailable/i)
+        expect(result.message).toContain(signal)
+        expect(result.message).not.toContain("claude login")
+      })
+    }
+
+    it("preserves global authentication precedence over a signal exit", () => {
+      expect(classifyError("Claude Code process exited with code 143: authentication failed").status).toBe(401)
+    })
+
+    it("ignores signal text quoted in appended stderr", () => {
+      const result = classifyError("Claude Code process exited with code 2\nSubprocess stderr: helper process terminated by signal SIGTERM")
+      expect(result.status).toBe(502)
+      expect(result.message).not.toMatch(/service temporarily unavailable/i)
+    })
+
+    it("leaves other signals on the generic error path", () => {
+      const result = classifyError("Claude Code process terminated by signal SIGABRT")
+      expect(result.status).toBe(500)
+    })
+
     it("detects exit code with specific number", () => {
-      const result = classifyError("exited with code 137")
+      const result = classifyError("exited with code 2")
       expect(result.status).toBe(502)
       expect(result.type).toBe("api_error")
-      expect(result.message).toContain("137")
+      expect(result.message).toContain("2")
     })
 
     it("detects 'process exited' keyword", () => {
@@ -430,6 +568,17 @@ describe("classifyError", () => {
   })
 
   describe("session bookkeeping saturation", () => {
+    it("distinguishes queue capacity from a stalled holder without exposing host paths", () => {
+      const capacity = classifyError("lifecycle queue capacity reached for /private/session-gc.json.lock")
+      const stalled = classifyError("active lifecycle holder stalled for /private/session-gc.json.lock")
+      for (const result of [capacity, stalled]) {
+        expect(result.status).toBe(503)
+        expect(result.type).toBe("overloaded_error")
+        expect(result.message).not.toContain("/private")
+      }
+      expect(capacity.message).not.toBe(stalled.message)
+    })
+
     it("classifies the lifecycle lock wait as proxy load, not a request timeout", () => {
       const result = classifyError("timed out waiting for /var/lib/meridian/.cache/meridian/session-gc.json.lock")
       expect(result.status).toBe(503)
@@ -527,6 +676,15 @@ describe("classifyError", () => {
 
     it("reads the refusal out of a longer message", () => {
       expect(classifyResumeRefusal(new Error("claude code returned an error result: No message found with message.uuid of: abc123"))).toBe("missing-message")
+    })
+
+    it("finds the missing-message refusal on stderr when the error only carries the exit code (#1371)", () => {
+      expect(
+        classifyResumeRefusal(
+          new Error("Claude Code process exited with code 1"),
+          "No message found with message.uuid of: e663b687-6d08-4cc4-b9a9-5245ce8f1e07",
+        ),
+      ).toBe("missing-message")
     })
 
     it("a session that would not open is unresumable, not proven gone", () => {
@@ -978,6 +1136,12 @@ describe("classifyError: session/usage limit phrasings (live-observed)", () => {
     ["prose switch suffix", "Claude Code returned an error result: You've reached your Fable limit. Switch to another model to continue."],
     ["prose switch suffix, bare banner", "You've reached your Fable 5 limit. Switch to another model to continue."],
     ["prose switch suffix without the trailing clause", "You've reached your Opus limit. Switch to another model."],
+    // Claude Code 2.1.322 splices a usage-credits link into the prose suffix
+    // when credits can be bought. Observed on a Max pool: every Fable turn of
+    // the affected profile returned 500 api_error and the client retried it on
+    // the same profile while others still had Fable window left.
+    ["prose switch suffix with a usage-credits link", "Claude Code returned an error result: You've reached your Fable limit. Switch to another model, or manage usage credits at https://claude.ai/settings/usage?from=cc_cli_limit_message, to continue.\nSubprocess stderr: Warning: Custom betas are only available for API key users. Ignoring provided betas."],
+    ["prose switch suffix with the admin usage-credits link", "You've reached your Opus 4.6 limit. Switch to another model, or manage usage credits at https://claude.ai/admin-settings/usage, to continue."],
     // An API-key or gateway profile gets the upstream status spliced in ahead of
     // the banner. Found by driving the real failover path: the classifier said
     // rate_limit_error for the bare string while the live request still 500'd,
@@ -1010,6 +1174,8 @@ describe("classifyError: session/usage limit phrasings (live-observed)", () => {
     // The prose suffix is enumerated, not a licence for any tail: a sentence
     // that merely starts like it must still fall through.
     ["prose switch suffix continuing into documentation", "You've reached your Fable 5 limit. Switch to another model to continue, the docs say, but the account is healthy"],
+    ["usage-credits link that is not claude.ai", "You've reached your Fable limit. Switch to another model, or manage usage credits at https://example.com/usage, to continue."],
+    ["usage-credits link continuing into documentation", "You've reached your Fable limit. Switch to another model, or manage usage credits at https://claude.ai/settings/usage, to continue, the docs say"],
     // The status allowance is exactly three digits immediately before the
     // banner, so neither a longer number nor an arbitrary numeric preamble
     // opens the line up.

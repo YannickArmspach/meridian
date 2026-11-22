@@ -30,6 +30,16 @@ const initial = (content = "Get receipt") => ({ model: "fixture-model", max_toke
 afterEach(async () => { for (const close of closing.splice(0)) await close() })
 
 describe("Antigravity request contract", () => {
+  for (const count of [129, 256]) it(`preserves all ${count} client tool definitions`, () => {
+    const tools = Array.from({ length: count }, (_, index) => ({ ...tool, name: `lookup_${index + 1}` }))
+    const request = parseAgRequest({ ...initial(), tools, tool_choice: { type: "tool", name: `lookup_${count}` } })
+    expect(request.tools).toEqual(tools)
+    expect(renderAgPrompt(request)).toContain(JSON.stringify(tools.at(-1)))
+    expect(() => parseAgRequest({ ...initial(), tools: [...tools, tools[0]] })).toThrow("Duplicate tool names")
+    expect(() => parseAgRequest({ ...initial(), tools: [...tools, { ...tool, name: "invalid.name" }] })).toThrow("tools")
+    expect(() => parseAgRequest({ ...initial(), tools: [...tools, { name: "malformed", input_schema: [] }] })).toThrow("tools")
+  })
+
   it("rejects images and unsupported controls before creating a process", () => {
     expect(() => parseAgRequest({ ...initial(), messages: [{ role: "user", content: [{ type: "image", source: {} }] }] })).toThrow("text")
     expect(() => parseAgRequest({ ...initial(), temperature: 0 })).toThrow("temperature")
@@ -81,6 +91,15 @@ describe("Antigravity request contract", () => {
 })
 
 describe.skipIf(process.platform === "win32")("Antigravity HTTP/CLI integration", () => {
+  it("rejects a malformed schema beyond the former catalog limit", async () => {
+    const { runtime, send } = fixture()
+    const tools = Array.from({ length: 256 }, (_, index) => ({ ...tool, name: `lookup_${index + 1}` }))
+    const response = await send({ ...initial(), tools: [...tools, { name: "invalid_schema", input_schema: { type: "not-a-json-schema-type" } }] })
+    expect(response.status).toBe(400)
+    expect(await response.text()).toContain("Tool invalid_schema: Invalid or unsupported JSON Schema")
+    expect(runtime.runs.size).toBe(0)
+  })
+
   it("returns model discovery, health, text and per-invocation usage", async () => {
     const { server, send } = fixture()
     const health = await server.app.fetch(new Request("http://local/health"))
@@ -310,11 +329,16 @@ describe.skipIf(process.platform === "win32")("Antigravity HTTP/CLI integration"
     expect(sse).not.toContain("event: message_stop")
   })
   it("bounds pending tool lifetime and recovers completed history without repeating a call", async () => {
-    const { send, runtime } = fixture({ pendingToolTimeoutMs: 40 })
+    const { send, runtime } = fixture({ pendingToolTimeoutMs: 40, idleConversationMs: 3000 })
     const request = initial()
     const first = await decode(await send(request))
     const run = [...runtime.runs.values()][0]!
-    await run.settled
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([run.settled, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Completed-conversation retention extended the pending-tool deadline")), 1000)
+      })])
+    } finally { clearTimeout(timer) }
     expect(runtime.runs.size).toBe(0)
     const response = await send({ ...request, messages: [...request.messages, { role: "assistant", content: first.content }, { role: "user", content: [{ type: "tool_result", tool_use_id: first.content[0]!.id, content: "late" }] }] })
     expect(response.status).toBe(200)
@@ -431,7 +455,24 @@ describe.skipIf(process.platform === "win32")("Antigravity HTTP/CLI integration"
   })
   it("sends long conversation history on stdin instead of exceeding argv limits", async () => {
     const { send } = fixture()
-    expect((await send({ ...initial("a".repeat(200000)), tools: [] })).status).toBe(200)
+    // Above Linux's 128 KiB single-argument limit, below the byte limit past which agy drops the end of a prompt.
+    expect((await send({ ...initial("a".repeat(150000)), tools: [] })).status).toBe(200)
+  })
+  it("rejects a current request agy would silently cut short with a 400 instead of answering from part of it", async () => {
+    const { send } = fixture()
+    const response = await send({ ...initial("a".repeat(200000)), tools: [] })
+    expect(response.status).toBe(400)
+    expect(JSON.stringify(await response.json())).toMatch(/prompt is too long/)
+  })
+  it("shrinks an old tool result of a replayed history to fit agy's input limit and keeps the newest result intact", async () => {
+    const { send } = fixture()
+    const newest = "NEWEST_RESULT_" + "n".repeat(60000)
+    const use = (id: string) => ({ role: "assistant", content: [{ type: "tool_use", id, name: "lookup", input: { key: id } }] })
+    const result = (id: string, content: string) => ({ role: "user", content: [{ type: "tool_result", tool_use_id: id, content }] })
+    const messages = [{ role: "user", content: "Get receipt" }, use("call_old"), result("call_old", "OLD_RESULT_" + "o".repeat(150000)), { role: "assistant", content: "Done." }, { role: "user", content: "Now read the new file" }, use("call_new"), result("call_new", newest)]
+    const response = await send({ ...initial(), messages })
+    expect(response.status).toBe(200)
+    expect((await decode(response)).content[0]!.text).toBe(newest)
   })
   it("honors Meridian API keys while keeping health probes public", async () => {
     const previous = process.env.MERIDIAN_API_KEY
@@ -495,6 +536,14 @@ describe.skipIf(process.platform === "win32")("Antigravity HTTP/CLI integration"
     expect(provider.accounts[0]!.windows[0]).toMatchObject({ group: "Gemini Models", utilization: 0.25 })
     const page = await server.app.fetch(new Request("http://local/providers/view?provider=antigravity"))
     expect(await page.text()).toContain('data-provider-card="antigravity"')
+  })
+
+  it("serves the favicon its provider page links", async () => {
+    const { server } = fixture()
+    const response = await server.app.fetch(new Request("http://local/telemetry/icon.svg"))
+    expect(response.status).toBe(200)
+    expect(response.headers.get("content-type")).toBe("image/svg+xml")
+    expect(await response.text()).toContain("<svg")
   })
 
   it("runs the generated policy and permits only declared client MCP calls", async () => {

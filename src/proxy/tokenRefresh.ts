@@ -22,7 +22,7 @@ import { dirname, join, resolve } from "node:path"
 import { promisify } from "node:util"
 import { claudeLog } from "../logger"
 import { isCredentialsReadOnly, refuseCredentialWrite } from "./credentialsMode"
-import { fetchOAuthPlanFields, planFieldsMissing } from "./oauthPlan" 
+import { planReadingDue, readPlanUpdate, resetPlanRecheck, runCredentialMaintenance } from "./planRecheck"
 
 const execFile = promisify(execFileCb)
 
@@ -77,7 +77,8 @@ export interface OAuthCredentials {
    * personal Max 5x reports — and a Standard seat reports `default_raven`,
    * which names no published allotment at all.
    */
-  seatTier?: string
+  seatTier?: string | null
+  planCheckedAt?: number
 }
 
 export interface CredentialsFile {
@@ -120,7 +121,9 @@ function guardCredentialWrites(store: CredentialStore): CredentialStore {
       if (isCredentialsReadOnly()) {
         return refuseCredentialWrite("credential-store", store.refreshKey ?? "unknown-store")
       }
-      return store.write(credentials)
+      const written = await store.write(credentials)
+      if (written) invalidateCredentialFacts(store.refreshKey)
+      return written
     },
   }
 }
@@ -200,7 +203,15 @@ function buildMacosStore(serviceName: string): CredentialStore {
         )
         return true
       } catch (err) {
-        claudeLog("token_refresh.keychain_write_failed", { service: serviceName, error: String(err) })
+        // execFile errors include command arguments, including the credential
+        // passed to security's -w flag. Keep only non-secret failure metadata.
+        claudeLog("token_refresh.keychain_write_failed", {
+          service: serviceName,
+          reason: "command_failed",
+          exitCode: err instanceof Error && "code" in err && typeof err.code === "number"
+            ? err.code
+            : undefined,
+        })
         return false
       }
     },
@@ -253,14 +264,22 @@ const fileStore: CredentialStore = buildFileStore(CREDENTIALS_FILE)
  * (Linux). Default behaviour (no opts) is unchanged — reads from the
  * standard `~/.claude` location.
  */
+let credentialStorePlatformOverrideForTests: NodeJS.Platform | null = null
+
+/** Test-only override so file-backed credential routes can run on macOS without touching the login Keychain. */
+export function setCredentialStorePlatformForTests(override: NodeJS.Platform | null): void {
+  credentialStorePlatformOverrideForTests = override
+}
+
 export function createPlatformCredentialStore(opts?: { claudeConfigDir?: string }): CredentialStore {
+  const currentPlatform = credentialStorePlatformOverrideForTests ?? platform()
   if (opts?.claudeConfigDir) {
-    if (platform() === "darwin") {
+    if (currentPlatform === "darwin") {
       return buildMacosStore(configDirToKeychainService(opts.claudeConfigDir))
     }
     return buildFileStore(configDirToCredentialsFile(opts.claudeConfigDir))
   }
-  return platform() === "darwin" ? macosStore : fileStore
+  return currentPlatform === "darwin" ? macosStore : fileStore
 }
 
 /** Look up the appropriate file path for a profile (Linux convention even on macOS for inspection). */
@@ -280,27 +299,42 @@ export function credentialsFilePathForProfile(claudeConfigDir?: string): string 
  */
 export type StoredCredentialPresence = "present" | "absent" | "unknown"
 
-export async function readStoredCredentialPresence(
-  store: CredentialStore,
-): Promise<StoredCredentialPresence> {
+/** Current, uncached facts about this store; deadlines do not establish auth. */
+export interface StoredCredentialSnapshot {
+  presence: StoredCredentialPresence
+  refreshTokenExpiresAt?: number
+  accessTokenExpiresAt?: number
+}
+
+function validStoredExpiry(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 8.64e15
+    ? value : undefined
+}
+
+export async function readStoredCredentialSnapshot(store: CredentialStore): Promise<StoredCredentialSnapshot> {
   let credentials: CredentialsFile | null
   try {
     credentials = await store.read()
   } catch {
-    return "unknown"
+    return { presence: "unknown" }
   }
-  if (!credentials) return "unknown"
-  const accessToken = credentials.claudeAiOauth?.accessToken
-  return typeof accessToken === "string" && accessToken.length > 0 ? "present" : "absent"
+  if (!credentials) return { presence: "unknown" }
+  const oauth = credentials.claudeAiOauth
+  const accessToken = oauth?.accessToken
+  return {
+    presence: typeof accessToken === "string" && accessToken.length > 0 ? "present" : "absent",
+    refreshTokenExpiresAt: validStoredExpiry(oauth?.refreshTokenExpiresAt),
+    accessTokenExpiresAt: validStoredExpiry(oauth?.expiresAt),
+  }
+}
+
+export async function readStoredCredentialPresence(store: CredentialStore): Promise<StoredCredentialPresence> {
+  return (await readStoredCredentialSnapshot(store)).presence
 }
 
 // ---------------------------------------------------------------------------
 // OAuth refresh
 // ---------------------------------------------------------------------------
-
-/** In-flight refresh promises — deduplicates concurrent callers per credential store. */
-const inflightRefreshByKey = new Map<string, Promise<boolean>>()
-const inflightRefreshByStore = new WeakMap<CredentialStore, Promise<boolean>>()
 
 /**
  * Refresh the Claude Code OAuth access token.
@@ -328,26 +362,33 @@ export async function refreshOAuthToken(store?: CredentialStore): Promise<boolea
     return refuseCredentialWrite("oauth-refresh", s.refreshKey ?? "unknown-store")
   }
 
-  const refreshKey = s.refreshKey
-  if (refreshKey) {
-    const inflight = inflightRefreshByKey.get(refreshKey)
-    if (inflight) return inflight
+  return runCredentialMaintenance(s, { kind: "token", run: () => doRefresh(s) })
+}
 
-    const refresh = doRefresh(s).finally(() => {
-      inflightRefreshByKey.delete(refreshKey)
-    })
-    inflightRefreshByKey.set(refreshKey, refresh)
-    return refresh
-  }
-
-  const inflight = inflightRefreshByStore.get(s)
-  if (inflight) return inflight
-
-  const refresh = doRefresh(s).finally(() => {
-    inflightRefreshByStore.delete(s)
-  })
-  inflightRefreshByStore.set(s, refresh)
-  return refresh
+/**
+ * Re-read the plan of a credential whose access token is still valid, and
+ * write only the plan fields the reading carried. Runs in the same per-store
+ * slot as a token rotation, so a slow plan response can never write back
+ * tokens a concurrent rotation has already replaced.
+ */
+async function recheckStoredPlan(store: CredentialStore): Promise<boolean> {
+  const credentials = await store.read()
+  if (!credentials?.claudeAiOauth.accessToken) return false
+  const update = await readPlanUpdate(credentials.claudeAiOauth, store)
+  if (!update) return true
+  // The slot does not cover the CLI, a re-login or another instance, any of
+  // which may rotate the tokens during the lookup. Lay the plan over what is
+  // on disk now, and only while it is still the token the plan was read with:
+  // writing back the tokens read before the lookup could restore a spent
+  // refresh token.
+  const current = await store.read()
+  if (current?.claudeAiOauth.accessToken !== credentials.claudeAiOauth.accessToken) return true
+  current.claudeAiOauth = { ...current.claudeAiOauth, ...update.fields, planCheckedAt: update.checkedAt }
+  if (update.fields.seatTier === null) delete current.claudeAiOauth.seatTier
+  if (!(await store.write(current))) return false
+  invalidateCredentialFacts(store.refreshKey)
+  claudeLog("auth.plan_rechecked", { fields: update.fields, checkedAt: update.checkedAt })
+  return true
 }
 
 async function doRefresh(store: CredentialStore): Promise<boolean> {
@@ -431,26 +472,20 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
     ...(refreshTokenExpiresAt ? { refreshTokenExpiresAt } : {}),
   }
 
-  // The plan is only ever written at login, so a credential file created before
-  // Meridian persisted it stays plan-blind forever — nothing else in the
-  // lifecycle ever asks. A refresh is the one other moment that holds a valid
-  // access token, which is what the profile endpoint requires, so it is the
-  // only place a backfill can happen without forcing an interactive re-login.
-  //
-  // Gated on the fields being absent, so this costs one extra GET once per
-  // profile rather than on every ~8h refresh: the next refresh reads the value
-  // this one wrote and skips. Merged before the write so the whole thing is
-  // still a single store write, and spread UNDER the existing fields so a
-  // value already on disk always wins over a freshly fetched one.
-  const backfilled = planFieldsMissing(credentials.claudeAiOauth)
-    ? await fetchOAuthPlanFields(tokenData.access_token)
-    : {}
-  if (backfilled.subscriptionType || backfilled.rateLimitTier) {
-    credentials.claudeAiOauth = { ...backfilled, ...credentials.claudeAiOauth }
+  // A plan can change while the login stays the same (Pro to Max, a Team seat
+  // moved to another tier), so a reading expires instead of being taken once.
+  // A due reading rides along with the rotation's single write; a fresh
+  // reported field wins over the stored one, and a field the reading omitted
+  // keeps its stored value.
+  const planUpdate = await readPlanUpdate(credentials.claudeAiOauth, store)
+  if (planUpdate) credentials.claudeAiOauth = {
+    ...credentials.claudeAiOauth, ...planUpdate.fields, planCheckedAt: planUpdate.checkedAt,
   }
+  if (planUpdate?.fields.seatTier === null) delete credentials.claudeAiOauth.seatTier
 
   const written = await store.write(credentials)
   if (!written) return false
+  invalidateCredentialFacts(store.refreshKey)
 
   // Logged so it is observable whether Anthropic ever rolls the refresh-token
   // window — undefined here means the renewal countdown stays anchored to the
@@ -458,7 +493,7 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
   claudeLog("token_refresh.success", {
     expiresAt,
     refreshTokenExpiresAt,
-    backfilledPlan: Object.keys(backfilled),
+    backfilledPlan: Object.keys(planUpdate?.fields ?? {}),
   })
   return true
 }
@@ -476,16 +511,26 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
  * expiresAt, refresh request failed). False is non-fatal — the caller
  * proceeds with whatever token is on disk and falls back to the reactive
  * refresh-on-401 path if Anthropic rejects it.
+ *
+ * `recheckPlan` is for the background maintenance loop only: a valid token
+ * then also gets its plan re-read when that reading is due. The request path
+ * leaves it off, so admitting a request never waits on the profile endpoint.
  */
 export async function ensureFreshToken(
   store?: CredentialStore,
   bufferMs = 5 * 60 * 1000,
+  recheckPlan = false,
 ): Promise<boolean> {
   const s = store ?? createPlatformCredentialStore()
   const credentials = await s.read()
   const expiresAt = credentials?.claudeAiOauth?.expiresAt
   if (!expiresAt) return false
-  if (expiresAt - Date.now() > bufferMs) return true
+  if (expiresAt - Date.now() > bufferMs) {
+    if (recheckPlan && !isCredentialsReadOnly() && planReadingDue(credentials.claudeAiOauth, s)) {
+      await runCredentialMaintenance(s, { kind: "plan", run: () => recheckStoredPlan(s) })
+    }
+    return true
+  }
   // Read-only instances report the token as they found it instead of routing
   // into a refusal. This runs before every SDK request, so the refusal log
   // would repeat per request for the whole buffer window; the refusal belongs
@@ -565,14 +610,27 @@ interface StoredCredentialFacts {
   refreshTokenExpiresAt?: number
   subscriptionType?: string
   rateLimitTier?: string
-  seatTier?: string
+  seatTier?: string | null
 }
 
 const credentialFactsCache = new Map<string, { value: StoredCredentialFacts; at: number }>()
 const credentialFactsInflight = new Map<string, Promise<StoredCredentialFacts>>()
+// Bumped by every successful write, so a read that started before the write
+// cannot cache the value it saw once it finishes.
+const credentialFactsVersions = new Map<string, number>()
+let credentialFactsGeneration = 0
+
+function invalidateCredentialFacts(key: string | undefined): void {
+  if (!key) return
+  credentialFactsVersions.set(key, (credentialFactsVersions.get(key) ?? 0) + 1)
+  credentialFactsCache.delete(key)
+  credentialFactsInflight.delete(key)
+}
 
 /** Drop cached credential facts — for tests, and after a re-login. */
 export function resetAuthRenewalCache(): void {
+  credentialFactsGeneration++
+  credentialFactsVersions.clear()
   credentialFactsCache.clear()
   credentialFactsInflight.clear()
 }
@@ -597,6 +655,8 @@ async function readCredentialFacts(s: CredentialStore): Promise<StoredCredential
     if (inflight) return inflight
   }
 
+  const generation = credentialFactsGeneration
+  const version = key ? credentialFactsVersions.get(key) ?? 0 : 0
   const read = (async (): Promise<StoredCredentialFacts> => {
     let credentials: CredentialsFile | null = null
     try {
@@ -611,7 +671,9 @@ async function readCredentialFacts(s: CredentialStore): Promise<StoredCredential
       rateLimitTier: oauth?.rateLimitTier,
       seatTier: oauth?.seatTier,
     }
-    if (key) credentialFactsCache.set(key, { value, at: Date.now() })
+    if (key && generation === credentialFactsGeneration && version === (credentialFactsVersions.get(key) ?? 0)) {
+      credentialFactsCache.set(key, { value, at: Date.now() })
+    }
     return value
   })()
 
@@ -620,7 +682,7 @@ async function readCredentialFacts(s: CredentialStore): Promise<StoredCredential
   try {
     return await read
   } finally {
-    credentialFactsInflight.delete(key)
+    if (credentialFactsInflight.get(key) === read) credentialFactsInflight.delete(key)
   }
 }
 
@@ -659,9 +721,18 @@ export async function getAuthRenewalStatus(
   // Only the READ is cached. The day count and the flag are recomputed every
   // call so elapsed time and a changed warnDays are always reflected.
   const { refreshTokenExpiresAt } = await readCredentialFacts(s)
+  return renewalStatusFor(refreshTokenExpiresAt, warnDays)
+}
+
+/** The existing /health rounded-day warning rule, reused for profile expiry. */
+export function renewalStatusFor(
+  refreshTokenExpiresAt: number | undefined,
+  warnDays = DEFAULT_RENEWAL_WARN_DAYS,
+  now: number = Date.now(),
+): AuthRenewalStatus {
   if (!refreshTokenExpiresAt) return { renewalRequiredSoon: false }
 
-  const msRemaining = refreshTokenExpiresAt - Date.now()
+  const msRemaining = refreshTokenExpiresAt - now
   // Ceil, matching the CLI's own `Math.ceil(remaining / 86400000)` so this
   // number reads identically to the "Your login expires in N days" warning
   // Claude Code prints. Flooring here would report one day fewer than the
@@ -807,5 +878,5 @@ export function isBackgroundRefreshActive(): boolean {
 
 /** Reset in-flight state — for testing only. */
 export function resetInflightRefresh(): void {
-  inflightRefreshByKey.clear()
+  resetPlanRecheck()
 }

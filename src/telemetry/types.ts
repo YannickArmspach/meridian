@@ -67,6 +67,12 @@ export interface RequestMetric {
   /** Original model string from the client request (e.g. "claude-sonnet-4-6-20250312") */
   requestModel?: string
 
+  /** Effective SDK Haiku tier pin recorded for this request, when known.
+   *  This is configuration used for the SDK query, not an observed served
+   *  model or evidence of native authentication/model access. Absent on
+   *  legacy records or paths that do not record an effective Haiku pin. */
+  resolvedModel?: string
+
   /** Profile that served the request (multi-account). On records written
    *  before profile resolution ran this falls back to the pinned profile
    *  header, and is absent only when there was no pin either. */
@@ -190,6 +196,14 @@ export interface RequestMetric {
   /** Cache hit ratio: cacheRead / (cacheRead + cacheCreation + uncached).
    *  1.0 = perfect caching, 0.0 = no caching. undefined when no token data. */
   cacheHitRate?: number
+
+  /** ChatGPT only: hidden reasoning tokens. Already INSIDE outputTokens and
+   *  priced there - informational, never added to cost again. */
+  reasoningOutputTokens?: number
+
+  /** ChatGPT only: the model the client asked for, when a Fallback Model
+   *  retry served this request on `model` instead. */
+  fallbackFromModel?: string
 }
 
 export interface PhaseTiming {
@@ -297,6 +311,26 @@ export interface TelemetrySummary {
 
   /** Estimated cost of the window's usage at static API list prices */
   costEstimate: CostEstimate
+
+  /** Prompt-cache keepalive beats in the window. They answer no client, so
+   *  every other figure above excludes them; they are totalled only here. */
+  cacheKeepalive: CacheKeepaliveSummary
+}
+
+/** What the window's prompt-cache keepalive beats did and cost. */
+export interface CacheKeepaliveSummary {
+  /** Beats attempted. */
+  beats: number
+  /** Beats that reached upstream and refreshed the cache. */
+  reached: number
+  /** Beats that never reached upstream. Not errors: no client was answered. */
+  notReached: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  /** Estimated USD of the beats at the same list prices as costEstimate. */
+  estimatedUsd: number
 }
 
 /**
@@ -377,10 +411,12 @@ export interface ITelemetryStore {
   readonly size: number
   /** What this store holds and for how long — see TelemetryRetention. */
   describe(): TelemetryRetention
-  /** Retrieve recent metrics, newest first. */
+  /** Retrieve recent metrics, newest first. `since` is inclusive; `until` is
+   *  exclusive, and rows at or after it do not count toward `limit`. */
   getRecent(options?: {
     limit?: number
     since?: number
+    until?: number
     model?: string
   }): RequestMetric[]
   /** Find the latest successful metric for a given SDK session. */

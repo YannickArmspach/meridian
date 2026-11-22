@@ -4,25 +4,23 @@
  * GET /telemetry            — HTML dashboard
  * GET /telemetry/requests   — Recent request metrics (JSON)
  * GET /telemetry/summary    — Aggregate statistics (JSON)
+ * GET /telemetry/timeseries — Per-bucket requests, tokens, latency, cost (JSON)
  * GET /telemetry/logs       — Diagnostic logs (JSON)
  */
 
-import { existsSync, readFileSync } from "node:fs"
-import { resolve, dirname } from "node:path"
-import { fileURLToPath } from "node:url"
 import { Hono } from "hono"
 import { telemetryStore, diagnosticLog } from "./index"
 import { dashboardHtml } from "./dashboard"
+import { iconResponse } from "./icon"
+import { withSavedLayout } from "./pageLayout"
 import type { SessionTreeSummary } from "./types"
 import { collapseRouteChains, summarizeRoutes } from "./routeChain"
+import { buildTimeseries, parseTimeseriesQuery, TIMESERIES_MAX_ROWS } from "./timeseries"
+import { getPricingOverrides } from "./pricingStore"
 
 /** Upper bound on the rows one /routes tally reads, matching the memory
  *  store's ring capacity so a window inside it is covered exactly. */
 const ROUTE_SUMMARY_MAX_ROWS = 1000
-
-// Read once at module load — src/telemetry/ is two levels below the package root
-const _iconPath = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "assets", "icon.svg")
-const _iconSvg = existsSync(_iconPath) ? readFileSync(_iconPath, "utf-8") : null
 
 export interface TelemetryRouteDeps {
   /**
@@ -38,17 +36,11 @@ export function createTelemetryRoutes(deps: TelemetryRouteDeps = {}) {
 
   // Dashboard
   routes.get("/", (c) => {
-    return c.html(dashboardHtml)
+    return c.html(withSavedLayout(dashboardHtml))
   })
 
   // Favicon
-  routes.get("/icon.svg", (c) => {
-    if (!_iconSvg) return c.notFound()
-    return c.body(_iconSvg, 200, {
-      "Content-Type": "image/svg+xml",
-      "Cache-Control": "public, max-age=3600",
-    })
-  })
+  routes.get("/icon.svg", (c) => iconResponse() ?? c.notFound())
 
   // Recent requests
   routes.get("/requests", (c) => {
@@ -92,6 +84,26 @@ export function createTelemetryRoutes(deps: TelemetryRouteDeps = {}) {
     const summary = telemetryStore.summarize(windowMs)
     const sessionTree = deps.getSessionTree?.()
     return c.json(sessionTree ? { ...summary, sessionTree } : summary)
+  })
+
+  // Bucketed history over [start, end). Raw rows, not collapsed chains, so
+  // the buckets sum to /summary's totals for the same range.
+  routes.get("/timeseries", (c) => {
+    const now = Date.now()
+    const parsed = parseTimeseriesQuery({
+      start: c.req.query("start"),
+      end: c.req.query("end"),
+      window: c.req.query("window"),
+      bucket: c.req.query("bucket"),
+    }, now)
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400)
+    const { range } = parsed
+    const rows = telemetryStore.getRecent({ limit: TIMESERIES_MAX_ROWS, since: range.start, until: range.end })
+    return c.json(buildTimeseries(rows, range, {
+      limitReached: rows.length >= TIMESERIES_MAX_ROWS,
+      retention: telemetryStore.describe(),
+      now,
+    }, getPricingOverrides()))
   })
 
   // Diagnostic logs

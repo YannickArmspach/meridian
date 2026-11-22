@@ -3,9 +3,11 @@
  * Clears environment variables that would interfere with test isolation.
  */
 
+import { afterAll } from "bun:test"
 import { mkdirSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import "./fixtures/bookkeeping-engine-preload.mjs"
+import { removeTestDir, sweepStaleTestDirs, testDirsFor } from "./test-tmp-dirs"
 
 // Take the operator's whole configuration namespace away from the suite.
 //
@@ -40,15 +42,45 @@ delete process.env.CLAUDE_PROXY_FOLLOW_ACTIVE
 // to getSetting("routing") when MERIDIAN_ROUTING is unset — so those tests
 // were asserting against whatever the developer happened to have configured.
 // Keyed by pid so concurrent runs don't share state.
-process.env.MERIDIAN_CONFIG_DIR = join(tmpdir(), `meridian-test-settings-${process.pid}`)
-mkdirSync(process.env.MERIDIAN_CONFIG_DIR, { recursive: true })
-
+//
 // Isolate durable session mappings and transcript lifecycle metadata too.
 // Fresh SDK sessions are pre-journaled before spawn, so allowing tests to use
 // the developer's real session root would both pollute it and exhaust the
 // bounded ownership budget during the suite.
-process.env.MERIDIAN_SESSION_DIR = join(tmpdir(), `meridian-test-sessions-${process.pid}`)
-mkdirSync(process.env.MERIDIAN_SESSION_DIR, { recursive: true })
+//
+// The same goes for the system temp dir itself. Dozens of files make their
+// fixtures with `mkdtemp(join(tmpdir(), ...))` and most never remove them, so
+// each run used to leave hundreds of `meridian-*` directories in the
+// developer's TMPDIR. Pointing TMPDIR at a per-process directory puts all of
+// it where this teardown removes it in one go, along with whatever a child
+// spawned with `env: { ...process.env }` writes there. A child spawned with no
+// `env` gets this process's environment as it was at startup on Bun 1.3, so
+// its temp files still land in the outer TMPDIR there.
+//
+// All three directories are removed when this process exits; leftovers of runs
+// that were killed before they could exit are swept here (see
+// test-tmp-dirs.ts). One already carrying this pid can only be a dead
+// process's, so it is cleared rather than inherited.
+sweepStaleTestDirs(tmpdir())
+const { configDir, sessionDir, tempDir } = testDirsFor(tmpdir(), process.pid)
+for (const dir of [configDir, sessionDir, tempDir]) {
+  if (!removeTestDir(dir)) throw new Error(`Could not reset test scratch directory: ${dir}`)
+  mkdirSync(dir, { recursive: true })
+}
+// `bun test` emits neither "exit" nor "beforeExit"; an afterAll registered in a
+// preload is its once-per-run teardown, and it also runs after failures and
+// timeouts.
+afterAll(() => {
+  removeTestDir(configDir)
+  removeTestDir(sessionDir)
+  removeTestDir(tempDir)
+})
+process.env.MERIDIAN_CONFIG_DIR = configDir
+process.env.MERIDIAN_SESSION_DIR = sessionDir
+// `os.tmpdir()` reads TMPDIR on every call (TMP and TEMP on Windows).
+process.env.TMPDIR = tempDir
+process.env.TMP = tempDir
+process.env.TEMP = tempDir
 
 // Raise the pending-transcript ceiling for the suite (#917).
 //
